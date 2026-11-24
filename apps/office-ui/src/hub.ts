@@ -6,21 +6,37 @@ import type {
   AgyJob,
   AgyJobCreateResponse,
   AgyJobRequest,
+  AssignTaskRequest,
   AuditReport,
+  BusMessage,
   ConnectionState,
+  Conversation,
+  ConversationDetail,
+  CreateConversationRequest,
+  CreateOrgAgentRequest,
+  Department,
   DiscoveryReport,
+  GuardrailNotice,
+  HandoffTaskRequest,
   KnowledgeLintReport,
   LibraryFileResponse,
   LibraryTreeResponse,
+  OrgAgent,
+  OrgResponse,
+  PatchOrgAgentRequest,
   PatchProviderRequest,
   PatchSlotRequest,
   PendingApproval,
   PolicyBudget,
+  PostBusMessageRequest,
   ProviderRow,
+  RunConversationRequest,
+  RunConversationResponse,
   SaveLibraryFileRequest,
   SaveLibraryFileResponse,
   SignInSlotResponse,
   SyncResult,
+  TaskRecord,
   TestApprovalResponse,
 } from "./types.ts";
 
@@ -33,57 +49,70 @@ export class HubHttpError extends Error {
   readonly status: number;
   readonly path: string;
   readonly serverError?: string;
+  readonly serverReason?: string;
 
-  constructor(path: string, status: number, serverError?: string) {
-    super(serverError ? `${path} → HTTP ${status}: ${serverError}` : `${path} → HTTP ${status}`);
+  constructor(path: string, status: number, serverError?: string, serverReason?: string) {
+    const detail = serverReason
+      ? serverError
+        ? `${serverError}: ${serverReason}`
+        : serverReason
+      : serverError;
+    super(detail ? `${path} → HTTP ${status}: ${detail}` : `${path} → HTTP ${status}`);
     this.name = "HubHttpError";
     this.path = path;
     this.status = status;
     this.serverError = serverError;
+    this.serverReason = serverReason;
   }
 }
 
 async function requestJson<T>(
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
   path: string,
-  body?: unknown
+  body?: unknown,
+  actorId?: string
 ): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (actorId) headers["X-Actor-Id"] = actorId;
   const res = await fetch(`${HUB_HTTP}${path}`, {
     method,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
     let serverError: string | undefined;
+    let serverReason: string | undefined;
     try {
-      const data = (await res.json()) as { error?: unknown };
+      const data = (await res.json()) as { error?: unknown; reason?: unknown };
       if (typeof data?.error === "string") serverError = data.error;
+      if (typeof data?.reason === "string") serverReason = data.reason;
     } catch {
       // ignore non-JSON error body
     }
-    throw new HubHttpError(path, res.status, serverError);
+    throw new HubHttpError(path, res.status, serverError, serverReason);
   }
   return (await res.json()) as T;
 }
 
-function getJson<T>(path: string): Promise<T> {
-  return requestJson<T>("GET", path);
+function getJson<T>(path: string, actorId?: string): Promise<T> {
+  return requestJson<T>("GET", path, undefined, actorId);
 }
 
-function postJson<T>(path: string, body?: unknown): Promise<T> {
-  return requestJson<T>("POST", path, body);
+function postJson<T>(path: string, body?: unknown, actorId?: string): Promise<T> {
+  return requestJson<T>("POST", path, body, actorId);
 }
 
-function putJson<T>(path: string, body: unknown): Promise<T> {
-  return requestJson<T>("PUT", path, body);
+function putJson<T>(path: string, body: unknown, actorId?: string): Promise<T> {
+  return requestJson<T>("PUT", path, body, actorId);
 }
 
-function patchJson<T>(path: string, body: unknown): Promise<T> {
-  return requestJson<T>("PATCH", path, body);
+function patchJson<T>(path: string, body: unknown, actorId?: string): Promise<T> {
+  return requestJson<T>("PATCH", path, body, actorId);
 }
 
-function deleteJson<T>(path: string): Promise<T> {
-  return requestJson<T>("DELETE", path);
+function deleteJson<T>(path: string, actorId?: string): Promise<T> {
+  return requestJson<T>("DELETE", path, undefined, actorId);
 }
 
 export function isNotFoundError(err: unknown): boolean {
@@ -159,6 +188,96 @@ export function fetchAgyJob(id: string): Promise<AgyJob> {
   return getJson<AgyJob>(`/api/agy/jobs/${encodeURIComponent(id)}`);
 }
 
+// Org, Message Bus, Conversations & Tasks
+export function fetchOrg(): Promise<OrgResponse> {
+  return getJson<OrgResponse>("/api/org");
+}
+
+export function createOrgAgent(body: CreateOrgAgentRequest, actorId?: string): Promise<OrgAgent> {
+  return postJson<OrgAgent>("/api/org/agents", body, actorId);
+}
+
+export function patchOrgAgent(id: string, body: PatchOrgAgentRequest, actorId?: string): Promise<OrgAgent> {
+  return patchJson<OrgAgent>(`/api/org/agents/${encodeURIComponent(id)}`, body, actorId);
+}
+
+export function deleteOrgAgent(id: string, actorId?: string): Promise<{ ok: boolean }> {
+  return deleteJson<{ ok: boolean }>(`/api/org/agents/${encodeURIComponent(id)}`, actorId);
+}
+
+export function patchDepartmentHead(
+  departmentId: string,
+  headAgentId: string | null,
+  actorId?: string
+): Promise<Department> {
+  return patchJson<Department>(
+    `/api/org/departments/${encodeURIComponent(departmentId)}`,
+    { headAgentId },
+    actorId
+  );
+}
+
+export function postBusMessage(body: PostBusMessageRequest, actorId?: string): Promise<BusMessage> {
+  return postJson<BusMessage>("/api/bus/messages", body, actorId);
+}
+
+export function fetchBusMessages(params?: {
+  conversationId?: string;
+  limit?: number;
+  includeRejected?: boolean;
+}): Promise<BusMessage[]> {
+  const qs = new URLSearchParams();
+  if (params?.conversationId) qs.set("conversationId", params.conversationId);
+  if (params?.limit != null) qs.set("limit", String(params.limit));
+  if (params?.includeRejected) qs.set("includeRejected", "1");
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return getJson<BusMessage[]>(`/api/bus/messages${suffix}`);
+}
+
+export function fetchConversations(status: "open" | "all" = "all"): Promise<Conversation[]> {
+  return getJson<Conversation[]>(`/api/conversations?status=${encodeURIComponent(status)}`);
+}
+
+export function createConversation(body: CreateConversationRequest, actorId?: string): Promise<Conversation> {
+  return postJson<Conversation>("/api/conversations", body, actorId);
+}
+
+export function fetchConversationDetail(id: string): Promise<ConversationDetail> {
+  return getJson<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}`);
+}
+
+export function closeConversation(id: string, summary?: string, actorId?: string): Promise<Conversation> {
+  return postJson<Conversation>(
+    `/api/conversations/${encodeURIComponent(id)}/close`,
+    summary ? { summary } : {},
+    actorId
+  );
+}
+
+export function resumeConversation(id: string, actorId?: string): Promise<Conversation> {
+  return postJson<Conversation>(`/api/conversations/${encodeURIComponent(id)}/resume`, {}, actorId);
+}
+
+export function runConversation(
+  id: string,
+  body: RunConversationRequest,
+  actorId?: string
+): Promise<RunConversationResponse> {
+  return postJson<RunConversationResponse>(`/api/conversations/${encodeURIComponent(id)}/run`, body, actorId);
+}
+
+export function fetchTasks(): Promise<TaskRecord[]> {
+  return getJson<TaskRecord[]>("/api/tasks");
+}
+
+export function assignTask(body: AssignTaskRequest, actorId?: string): Promise<TaskRecord> {
+  return postJson<TaskRecord>("/api/tasks/assign", body, actorId);
+}
+
+export function handoffTask(body: HandoffTaskRequest, actorId?: string): Promise<TaskRecord> {
+  return postJson<TaskRecord>("/api/tasks/handoff", body, actorId);
+}
+
 export function useClock(enabled = true, intervalMs = 1000): number {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
@@ -171,11 +290,27 @@ export function useClock(enabled = true, intervalMs = 1000): number {
 }
 
 const MAX_EVENTS = 200;
+const MAX_BUS_MESSAGES = 250;
 const DEFAULT_BUDGET: PolicyBudget = {
   alwaysOnWarnTokens: 15000,
   alwaysOnBlockTokens: 19000,
   alwaysOnHardLimitTokens: 20000,
 };
+
+function toMs(v: number | string | null | undefined): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const parsed = Date.parse(v);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+function upsertConversation(list: Conversation[], conv: Conversation): Conversation[] {
+  const next = [conv, ...list.filter((c) => c.id !== conv.id)];
+  next.sort((a, b) => toMs(b.openedAt) - toMs(a.openedAt));
+  return next;
+}
 
 export interface HubState {
   connection: ConnectionState;
@@ -194,7 +329,22 @@ export interface HubState {
   accounts: AccountsResponse | null;
   accountsUnsupported: boolean;
   accountsError: string | null;
+  org: OrgResponse | null;
+  orgUnsupported: boolean;
+  orgError: string | null;
+  conversations: Conversation[];
+  conversationsUnsupported: boolean;
+  conversationsError: string | null;
+  tasks: TaskRecord[];
+  tasksUnsupported: boolean;
+  tasksError: string | null;
+  busMessages: BusMessage[];
+  busRevision: number;
+  lastGuardrail: GuardrailNotice | null;
   refreshAccounts: () => Promise<void>;
+  refreshOrg: () => Promise<void>;
+  refreshConversations: () => Promise<void>;
+  refreshTasks: () => Promise<void>;
   resolveApproval: (id: string, approved: boolean) => Promise<void>;
   createTestApproval: (action?: string) => Promise<TestApprovalResponse>;
   runAuditReport: (ai?: boolean) => Promise<AuditReport>;
@@ -220,6 +370,18 @@ export function useHub(): HubState {
   const [accounts, setAccounts] = useState<AccountsResponse | null>(null);
   const [accountsUnsupported, setAccountsUnsupported] = useState(false);
   const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [org, setOrg] = useState<OrgResponse | null>(null);
+  const [orgUnsupported, setOrgUnsupported] = useState(false);
+  const [orgError, setOrgError] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationsUnsupported, setConversationsUnsupported] = useState(false);
+  const [conversationsError, setConversationsError] = useState<string | null>(null);
+  const [tasks, setTasks] = useState<TaskRecord[]>([]);
+  const [tasksUnsupported, setTasksUnsupported] = useState(false);
+  const [tasksError, setTasksError] = useState<string | null>(null);
+  const [busMessages, setBusMessages] = useState<BusMessage[]>([]);
+  const [busRevision, setBusRevision] = useState(0);
+  const [lastGuardrail, setLastGuardrail] = useState<GuardrailNotice | null>(null);
   const attempt = useRef(0);
 
   const loadApprovals = useCallback(() => {
@@ -263,11 +425,62 @@ export function useHub(): HubState {
     }
   }, []);
 
+  const loadOrg = useCallback(async () => {
+    try {
+      const data = await fetchOrg();
+      setOrg(data);
+      setOrgUnsupported(false);
+      setOrgError(null);
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        setOrgUnsupported(true);
+        setOrgError(null);
+      } else {
+        setOrgError(e instanceof HubHttpError && e.serverError ? e.serverError : String(e));
+      }
+    }
+  }, []);
+
+  const loadConversations = useCallback(async () => {
+    try {
+      const list = await fetchConversations("all");
+      setConversations(list);
+      setConversationsUnsupported(false);
+      setConversationsError(null);
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        setConversationsUnsupported(true);
+        setConversationsError(null);
+      } else {
+        setConversationsError(e instanceof HubHttpError && e.serverError ? e.serverError : String(e));
+      }
+    }
+  }, []);
+
+  const loadTasks = useCallback(async () => {
+    try {
+      const list = await fetchTasks();
+      setTasks(list);
+      setTasksUnsupported(false);
+      setTasksError(null);
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        setTasksUnsupported(true);
+        setTasksError(null);
+      } else {
+        setTasksError(e instanceof HubHttpError && e.serverError ? e.serverError : String(e));
+      }
+    }
+  }, []);
+
   const refresh = useCallback(() => {
     loadApprovals();
     loadLint();
     loadAudit();
     void loadAccounts();
+    void loadOrg();
+    void loadConversations();
+    void loadTasks();
     getJson<DiscoveryReport>("/api/discovery").then(setDiscovery).catch(() => {});
     getJson<{ knowledgeBudget?: PolicyBudget }>("/api/policy")
       .then((p) => p.knowledgeBudget && setBudget({ ...DEFAULT_BUDGET, ...p.knowledgeBudget }))
@@ -275,7 +488,7 @@ export function useHub(): HubState {
     getJson<AgentEvent[]>("/api/events")
       .then((list) => setEvents(list.slice(0, MAX_EVENTS)))
       .catch(() => {});
-  }, [loadApprovals, loadLint, loadAudit, loadAccounts]);
+  }, [loadApprovals, loadLint, loadAudit, loadAccounts, loadOrg, loadConversations, loadTasks]);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -328,6 +541,35 @@ export function useHub(): HubState {
           loadLint();
         } else if (data.type === "accounts_changed") {
           void loadAccounts();
+        } else if (data.type === "bus_message" && data.message) {
+          const m = data.message as BusMessage;
+          setBusMessages((prev) => [m, ...prev.filter((x) => x.id !== m.id)].slice(0, MAX_BUS_MESSAGES));
+          setBusRevision((n) => n + 1);
+          if (m.conversationId) {
+            setConversations((prev) =>
+              prev.map((c) => (c.id === m.conversationId ? { ...c, lastMessage: m } : c))
+            );
+          }
+        } else if (data.type === "bus_rejected" && data.message) {
+          const m = data.message as BusMessage;
+          setBusMessages((prev) => [m, ...prev.filter((x) => x.id !== m.id)].slice(0, MAX_BUS_MESSAGES));
+          setBusRevision((n) => n + 1);
+        } else if (data.type === "conversation_changed" && data.conversation) {
+          const conv = data.conversation as Conversation;
+          setConversations((prev) => upsertConversation(prev, conv));
+          setConversationsUnsupported(false);
+          setBusRevision((n) => n + 1);
+        } else if (data.type === "guardrail") {
+          setLastGuardrail({
+            conversationId: String(data.conversationId ?? ""),
+            reason: String(data.reason ?? "Guardrail kích hoạt"),
+            at: Date.now(),
+          });
+          setBusRevision((n) => n + 1);
+          void loadConversations();
+        } else if (data.type === "org_changed") {
+          void loadOrg();
+          void loadTasks();
         }
       };
 
@@ -368,7 +610,7 @@ export function useHub(): HubState {
       clearInterval(lintTimer);
       ws?.close();
     };
-  }, [refresh, loadApprovals, loadLint, loadAccounts]);
+  }, [refresh, loadApprovals, loadLint, loadAccounts, loadOrg, loadConversations, loadTasks]);
 
   const resolveApproval = useCallback(
     async (id: string, approved: boolean) => {
@@ -427,7 +669,22 @@ export function useHub(): HubState {
     accounts,
     accountsUnsupported,
     accountsError,
+    org,
+    orgUnsupported,
+    orgError,
+    conversations,
+    conversationsUnsupported,
+    conversationsError,
+    tasks,
+    tasksUnsupported,
+    tasksError,
+    busMessages,
+    busRevision,
+    lastGuardrail,
     refreshAccounts: loadAccounts,
+    refreshOrg: loadOrg,
+    refreshConversations: loadConversations,
+    refreshTasks: loadTasks,
     resolveApproval,
     createTestApproval,
     runAuditReport,

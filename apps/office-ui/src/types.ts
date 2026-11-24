@@ -59,13 +59,23 @@ export interface PolicyBudget {
 
 export type ConnectionState = "connecting" | "open" | "closed";
 
-export type SeatStatus = AgentStatus | "offline";
+export type SeatStatus = AgentStatus | "offline" | "online" | "manual" | "busy";
 
 export interface Seat {
   id: string;
   name: string;
   role: string;
   provider?: AgentProvider;
+  orgProvider?: OrgAgentProvider;
+  orgKind?: OrgAgentKind;
+  departmentId?: string;
+  departmentName?: string;
+  isHead?: boolean;
+  isAdmin?: boolean;
+  bridge?: OrgAgentBridge;
+  slotId?: string | null;
+  model?: string | null;
+  note?: string | null;
   kind: "manager" | "supervisor" | "agent" | "placeholder";
   ready: boolean;
   reason?: string;
@@ -84,6 +94,9 @@ export const STATUS_LABEL: Record<SeatStatus, string> = {
   error: "Lỗi",
   stopped: "Đã dừng",
   offline: "Chưa sẵn sàng",
+  online: "Trực tuyến",
+  manual: "Nhập tay",
+  busy: "Đang bận",
 };
 
 export const STATUS_COLOR: Record<SeatStatus, string> = {
@@ -95,6 +108,9 @@ export const STATUS_COLOR: Record<SeatStatus, string> = {
   error: "#ff4d4f",
   stopped: "#8c8c8c",
   offline: "#3b4252",
+  online: "#2ecc71",
+  manual: "#e09f3e",
+  busy: "#4f9dff",
 };
 
 // Phase 3: Knowledge Library, Sync, AI Audit
@@ -324,3 +340,223 @@ export interface AgyJob {
   usage?: Record<string, number>;
   error?: unknown;
 }
+
+// Org, Message Bus, Meeting Room & Tasks (docs/specs/org-contract.md)
+export interface Department {
+  id: string;
+  name: string;
+  headAgentId: string | null;
+}
+
+export interface OrgRole {
+  id: string;
+  name: string;
+  departmentId: string;
+  defaultProvider?: string | null;
+  defaultEffort?: SlotEffort | string | null;
+  systemPrompt?: string | null;
+}
+
+export type OrgAgentKind = "human" | "grok_bot" | "local_agent";
+export type OrgAgentProvider = "human" | "grok_external" | "antigravity" | "cursor" | "codex";
+export type OrgAgentStatus = "online" | "offline" | "manual" | "idle" | "busy";
+export type OrgAgentBridge = "none" | "hub";
+
+export interface OrgAgent {
+  id: string;
+  name: string;
+  departmentId: string;
+  roleId: string;
+  kind: OrgAgentKind;
+  provider: OrgAgentProvider;
+  slotId: string | null;
+  model: string | null;
+  effort?: SlotEffort | string | null;
+  isHead: boolean;
+  isAdmin: boolean;
+  status: OrgAgentStatus;
+  bridge: OrgAgentBridge;
+  note?: string | null;
+}
+
+export interface OrgResponse {
+  departments: Department[];
+  roles: OrgRole[];
+  agents: OrgAgent[];
+}
+
+export interface CreateOrgAgentRequest {
+  id?: string;
+  name: string;
+  departmentId: string;
+  roleId: string;
+  kind?: OrgAgentKind;
+  provider: OrgAgentProvider;
+  slotId?: string | null;
+  model?: string | null;
+  effort?: SlotEffort | string | null;
+  bridge?: OrgAgentBridge;
+  note?: string | null;
+}
+
+export interface PatchOrgAgentRequest {
+  name?: string;
+  departmentId?: string;
+  roleId?: string;
+  provider?: OrgAgentProvider;
+  slotId?: string | null;
+  model?: string | null;
+  effort?: SlotEffort | string | null;
+  status?: OrgAgentStatus;
+  bridge?: OrgAgentBridge;
+  note?: string | null;
+}
+
+export type BusMessageKind = "request" | "reply" | "handoff" | "meeting";
+export type BusMessageStatus = "delivered" | "rejected";
+
+export interface BusMessage {
+  id: string;
+  ts: number | string;
+  fromAgentId: string;
+  toAgentId: string | null;
+  conversationId: string | null;
+  taskId: string | null;
+  kind: BusMessageKind;
+  summary: string;
+  body: string | null;
+  tokenEstimate: number;
+  status: BusMessageStatus;
+  rejectReason: string | null;
+}
+
+export interface PostBusMessageRequest {
+  fromAgentId: string;
+  toAgentId?: string | null;
+  conversationId?: string | null;
+  taskId?: string | null;
+  kind: BusMessageKind;
+  summary: string;
+  body?: string | null;
+}
+
+export type ConversationType = "direct" | "meeting" | "handoff";
+export type ConversationStatus = "open" | "paused" | "closed";
+
+export interface Conversation {
+  id: string;
+  type: ConversationType;
+  title: string;
+  participants: string[];
+  status: ConversationStatus;
+  turnCap: number;
+  turns: number;
+  createdBy: string;
+  taskId: string | null;
+  summary: string | null;
+  pauseReason: string | null;
+  openedAt: number | string;
+  closedAt: number | string | null;
+  lastMessage?: BusMessage | null;
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: BusMessage[];
+}
+
+export interface CreateConversationRequest {
+  type: "meeting";
+  title: string;
+  participants: string[];
+  turnCap?: number;
+  taskId?: string | null;
+}
+
+export interface RunConversationRequest {
+  rounds: number;
+  prompt: string;
+}
+
+export interface RunConversationResponse {
+  ok: boolean;
+  runId: string;
+}
+
+export type TaskKind = "assign" | "handoff";
+export type TaskStatus = "assigned" | "handed_off" | "accepted" | "done";
+
+export interface TaskRecord {
+  id: string;
+  title: string;
+  kind: TaskKind;
+  fromAgentId: string;
+  departmentId: string;
+  toAgentId: string | null;
+  summary: string;
+  decisions: string[];
+  status: TaskStatus;
+  conversationId: string | null;
+  createdAt: number | string;
+}
+
+export interface AssignTaskRequest {
+  title: string;
+  departmentId: string;
+  toAgentId?: string | null;
+  summary: string;
+  decisions?: string[];
+}
+
+export interface HandoffTaskRequest {
+  title: string;
+  fromAgentId: string;
+  departmentId: string;
+  toAgentId?: string | null;
+  summary: string;
+  decisions?: string[];
+}
+
+export interface GuardrailNotice {
+  conversationId: string;
+  reason: string;
+  at: number;
+}
+
+export interface DepartmentZone {
+  id: string;
+  name: string;
+  headAgentId: string | null;
+  headName: string | null;
+  position: [number, number, number];
+  size: [number, number];
+  color: string;
+  seats: Seat[];
+}
+
+export const CONVERSATION_TYPE_LABEL: Record<ConversationType, string> = {
+  direct: "Trực tiếp",
+  meeting: "Cuộc họp",
+  handoff: "Bàn giao",
+};
+
+export const CONVERSATION_STATUS_LABEL: Record<ConversationStatus, string> = {
+  open: "Đang mở",
+  paused: "Tạm dừng",
+  closed: "Đã đóng",
+};
+
+export const BUS_KIND_LABEL: Record<BusMessageKind, string> = {
+  request: "Yêu cầu",
+  reply: "Phản hồi",
+  handoff: "Bàn giao",
+  meeting: "Họp",
+};
+
+export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  assigned: "Đã giao",
+  handed_off: "Đã bàn giao",
+  accepted: "Đã nhận",
+  done: "Hoàn tất",
+};
+
+export const GROK_BOT_BADGE = "Bot Grok ngoài · nhập tay";
