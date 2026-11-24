@@ -483,9 +483,9 @@ export class AccountsService {
   private hydrateProvider(row: ProviderDbRow): ProviderRow {
     let detected: string | undefined;
     if (row.kind === "cursor") {
-      detected = Bun.which("agent") ?? Bun.which("cursor-agent") ?? undefined;
+      detected = Bun.which("agent") ?? Bun.which("cursor-agent") ?? "Chưa cài CLI (agent/cursor-agent)";
     } else if (row.kind === "codex") {
-      detected = Bun.which("codex") ?? undefined;
+      detected = Bun.which("codex") ?? "Chưa cài CLI (codex)";
     }
     return {
       id: row.id,
