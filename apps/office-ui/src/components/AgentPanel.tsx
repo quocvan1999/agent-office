@@ -1,4 +1,4 @@
-import { STATUS_COLOR, STATUS_LABEL, type AgentEvent, type Seat } from "../types.ts";
+import { GROK_BOT_BADGE, STATUS_COLOR, STATUS_LABEL, type AgentEvent, type Seat } from "../types.ts";
 
 export default function AgentPanel({
   seat,
@@ -15,12 +15,19 @@ export default function AgentPanel({
     .filter((e) => e.agentId === seat.id || (!knownIds.has(e.agentId) && e.provider === seat.provider))
     .slice(0, 20);
   const tel = seat.lastEvent?.telemetry;
+  const isGrokBot = seat.orgKind === "grok_bot" || seat.orgProvider === "grok_external";
   return (
     <section className="card panel">
       <div className="panel-head">
         <div>
-          <h3>{seat.name}</h3>
-          <div className="muted small">{seat.role}</div>
+          <h3>
+            {seat.name}
+            {seat.isHead ? " ★" : ""}
+          </h3>
+          <div className="muted small">
+            {seat.role}
+            {seat.departmentName ? ` · ${seat.departmentName}` : ""}
+          </div>
         </div>
         <button className="btn ghost" onClick={onClose} aria-label="Đóng">
           ✕
@@ -29,9 +36,18 @@ export default function AgentPanel({
       <div className="status-line">
         <span className="dot" style={{ background: STATUS_COLOR[seat.status] }} />
         {STATUS_LABEL[seat.status]}
-        {seat.provider && <span className="chip">{seat.provider}</span>}
+        {(seat.orgProvider ?? seat.provider) && <span className="chip">{seat.orgProvider ?? seat.provider}</span>}
+        {seat.isAdmin && <span className="chip ok">Admin</span>}
+        {isGrokBot && <span className="chip warn">{GROK_BOT_BADGE}</span>}
         <span className={`chip ${seat.ready ? "ok" : "warn"}`}>{seat.ready ? "sẵn sàng" : "chưa sẵn sàng"}</span>
       </div>
+      {(seat.slotId || seat.model || seat.bridge) && (
+        <div className="muted tiny" style={{ marginBottom: 6 }}>
+          {seat.slotId && `Slot: ${seat.slotId} · `}
+          {seat.model && `Model: ${seat.model} · `}
+          {seat.bridge && `Cầu nối: ${seat.bridge}`}
+        </div>
+      )}
       {seat.reason && <p className="muted small">{seat.reason}</p>}
       {seat.lastEvent && (
         <div className="summary">
