@@ -86,15 +86,118 @@ function Desk({ seat, selected, onSelect }: { seat: Seat; selected: boolean; onS
   );
 }
 
+const BOOK_ROWS: Array<{ y: number; books: Array<{ x: number; w: number; h: number; color: string }> }> = [
+  {
+    y: 0.42,
+    books: [
+      { x: -0.68, w: 0.16, h: 0.42, color: "#4f9dff" },
+      { x: -0.46, w: 0.18, h: 0.36, color: "#ffd166" },
+      { x: -0.22, w: 0.16, h: 0.44, color: "#06d6a0" },
+      { x: 0.04, w: 0.2, h: 0.38, color: "#ef476f" },
+      { x: 0.3, w: 0.16, h: 0.43, color: "#c77dff" },
+      { x: 0.56, w: 0.2, h: 0.35, color: "#8ecae6" },
+    ],
+  },
+  {
+    y: 1.02,
+    books: [
+      { x: -0.64, w: 0.2, h: 0.4, color: "#06d6a0" },
+      { x: -0.38, w: 0.16, h: 0.45, color: "#ff8a00" },
+      { x: -0.14, w: 0.18, h: 0.36, color: "#4f9dff" },
+      { x: 0.14, w: 0.18, h: 0.42, color: "#ffd166" },
+      { x: 0.42, w: 0.22, h: 0.38, color: "#c77dff" },
+    ],
+  },
+  {
+    y: 1.62,
+    books: [
+      { x: -0.6, w: 0.18, h: 0.38, color: "#ef476f" },
+      { x: -0.34, w: 0.22, h: 0.42, color: "#8ecae6" },
+      { x: -0.04, w: 0.16, h: 0.36, color: "#06d6a0" },
+      { x: 0.22, w: 0.2, h: 0.44, color: "#4f9dff" },
+      { x: 0.52, w: 0.18, h: 0.35, color: "#ffd166" },
+    ],
+  },
+];
+
+function LibraryBookshelf({ active, onOpen }: { active: boolean; onOpen: () => void }) {
+  return (
+    <group
+      position={[6.2, 0, -5.2]}
+      rotation={[0, -Math.PI / 6, 0]}
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpen();
+      }}
+      onPointerOver={() => (document.body.style.cursor = "pointer")}
+      onPointerOut={() => (document.body.style.cursor = "auto")}
+    >
+      {/* floor highlight */}
+      <mesh rotation-x={-Math.PI / 2} position={[0, 0.01, 0]} receiveShadow>
+        <circleGeometry args={[1.45, 40]} />
+        <meshStandardMaterial color={active ? "#2a3b5c" : "#1b2636"} />
+      </mesh>
+      {/* back panel */}
+      <mesh position={[0, 1.1, -0.22]} castShadow>
+        <boxGeometry args={[1.8, 2.2, 0.06]} />
+        <meshStandardMaterial color="#5b4330" />
+      </mesh>
+      {/* side panels */}
+      {[-0.87, 0.87].map((x) => (
+        <mesh key={x} position={[x, 1.1, 0]} castShadow>
+          <boxGeometry args={[0.08, 2.2, 0.48]} />
+          <meshStandardMaterial color="#75563d" />
+        </mesh>
+      ))}
+      {/* shelves */}
+      {[0.14, 0.74, 1.34, 1.94, 2.18].map((y) => (
+        <mesh key={y} position={[0, y, 0]} castShadow>
+          <boxGeometry args={[1.82, 0.07, 0.5]} />
+          <meshStandardMaterial color="#8d6e52" />
+        </mesh>
+      ))}
+      {/* books */}
+      {BOOK_ROWS.map((row) =>
+        row.books.map((b, idx) => (
+          <mesh key={`${row.y}-${idx}`} position={[b.x, row.y, 0.02]} castShadow>
+            <boxGeometry args={[b.w, b.h, 0.32]} />
+            <meshStandardMaterial
+              color={b.color}
+              emissive={active ? b.color : "#000000"}
+              emissiveIntensity={active ? 0.25 : 0}
+            />
+          </mesh>
+        ))
+      )}
+      <Html position={[0, 2.55, 0]} center distanceFactor={13} zIndexRange={[10, 0]}>
+        <div
+          className={`desk-label library ${active ? "selected" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen();
+          }}
+        >
+          <strong>Thư viện</strong>
+          <span>Kho ~/.cursor</span>
+        </div>
+      </Html>
+    </group>
+  );
+}
+
 export default function Office3D({
   seats,
   selectedId,
   onSelect,
+  libraryOpen,
+  onOpenLibrary,
   paused,
 }: {
   seats: Seat[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  libraryOpen: boolean;
+  onOpenLibrary: () => void;
   paused: boolean;
 }) {
   return (
@@ -117,6 +220,7 @@ export default function Office3D({
       {seats.map((s) => (
         <Desk key={s.id} seat={s} selected={s.id === selectedId} onSelect={onSelect} />
       ))}
+      <LibraryBookshelf active={libraryOpen} onOpen={onOpenLibrary} />
       <OrbitControls
         enablePan={false}
         minDistance={6}
