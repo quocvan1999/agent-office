@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -16,6 +17,11 @@ import {
   CursorAdapter,
 } from "../../../packages/adapters/src/index.ts";
 import type { AgentEvent } from "../../../packages/protocol/src/events.ts";
+import {
+  AccountsError,
+  AccountsService,
+  type SlotEffort,
+} from "./accounts.ts";
 import { AuditRateLimitError, AuditService } from "./audit.ts";
 import { OfficeDatabase } from "./db.ts";
 import { runDiscovery, scanKnowledgeHub } from "./discovery.ts";
@@ -35,7 +41,57 @@ if (args.has("--discover-only")) {
 if (args.has("--verify")) {
   const policies = loadPolicies();
   const lint = lintKnowledgeBudget(policies);
-  const agy = new AntigravityAdapter();
+
+  // Create stub agy script first so --verify never spawns the real agy binary
+  const tempAccRoot = join(tmpdir(), `agent-office-acc-verify-${Date.now()}`);
+  const tempProfilesRoot = join(tempAccRoot, "profiles");
+  const stubAgyBin = join(tempAccRoot, "agy-stub.sh");
+  mkdirSync(tempProfilesRoot, { recursive: true });
+  writeFileSync(
+    stubAgyBin,
+    `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "agy 1.5.0-stub"
+  exit 0
+fi
+if [ "$1" = "models" ]; then
+  if [ -f "$HOME/.stub_signed_in" ]; then
+    printf "gemini-2.5-pro\\tGemini 2.5 Pro\\nclaude-sonnet-4\\tClaude Sonnet 4\\n"
+    exit 0
+  else
+    echo "Error: Please sign in to Antigravity" >&2
+    exit 1
+  fi
+fi
+for arg in "$@"; do
+  case "$arg" in
+    --print=/quota)
+      printf "Gemini Models\\tWeekly Limit Remaining\\t97%%\\t2026-12-01T08:57:55Z\\n"
+      printf "Claude and GPT models\\tFive Hour Limit Remaining\\t100%%\\t2026-11-24T14:17:13Z\\n"
+      exit 0
+      ;;
+    --print=/credits)
+      printf "Remaining credits\\t1250\\nUpgrade at https://example.com\\n"
+      exit 0
+      ;;
+    --print=*)
+      if [ -f "$HOME/.stub_exhausted" ]; then
+        echo 'AGY_ERROR: {"short_error":"Quota exhausted until 2099-12-31T23:59:59Z","status":"RESOURCE_EXHAUSTED","retryable":false,"reason":"QUOTA_EXHAUSTED"}' >&2
+        exit 1
+      else
+        echo '{"type":"result","result":{"usage":{"input_tokens":120,"output_tokens":80,"thinking_tokens":10,"cache_read_tokens":5,"total_tokens":215}}}'
+        exit 0
+      fi
+      ;;
+  esac
+done
+exit 0
+`,
+    { mode: 0o755 }
+  );
+  chmodSync(stubAgyBin, 0o755);
+
+  const agy = new AntigravityAdapter(stubAgyBin);
   const cursor = new CursorAdapter();
   const codex = new CodexAdapter();
   const api = new ApiModelAdapter();
@@ -241,6 +297,127 @@ if (args.has("--verify")) {
     }
   }
 
+  // 6. Verify Accounts Hub (slots, quota parse, model PATCH validation, rotation + cooldown, usage)
+  let accSlotCreateCheckOk = false;
+  let accQuotaParseOk = false;
+  let accModelPatchOk = false;
+  let accRotationCooldownOk = false;
+  let accUsageCountedOk = false;
+  const tempAccDbPath = join(tempAccRoot, "accounts-verify.sqlite");
+  try {
+    const accDb = new OfficeDatabase(tempAccDbPath);
+    const accOrch = new HubOrchestrator(accDb);
+    const accSvc = new AccountsService({
+      db: accDb,
+      orchestrator: accOrch,
+      agyBin: stubAgyBin,
+      profilesRoot: tempProfilesRoot,
+      quotaRefreshMin: 0,
+      repoRoot: process.cwd(),
+    });
+
+    const initialState = accSvc.getAccounts();
+    const hasDefault = initialState.slots.some((s) => s.id === "default" && s.isDefault);
+    const hasProviders =
+      initialState.providers.length === 10 &&
+      initialState.providers.every((p) => p.source === "none" && p.usedPct === null);
+
+    const alpha = accSvc.createSlot({ name: "Slot Alpha" });
+    const beta = accSvc.createSlot({ name: "Slot Beta" });
+
+    // Before sign-in -> signed_out
+    const alphaSignedOut = await accSvc.checkSlot(alpha.id);
+
+    // Mark both slots signed in + write email in cli.log
+    writeFileSync(join(alpha.homeDir, ".stub_signed_in"), "1", "utf8");
+    writeFileSync(join(beta.homeDir, ".stub_signed_in"), "1", "utf8");
+    mkdirSync(join(alpha.homeDir, ".gemini", "antigravity-cli"), { recursive: true });
+    mkdirSync(join(beta.homeDir, ".gemini", "antigravity-cli"), { recursive: true });
+    writeFileSync(
+      join(alpha.homeDir, ".gemini", "antigravity-cli", "cli.log"),
+      "info email=old@example.com\ninfo email=alpha@example.com\n",
+      "utf8"
+    );
+    writeFileSync(
+      join(beta.homeDir, ".gemini", "antigravity-cli", "cli.log"),
+      "info email=beta@example.com\n",
+      "utf8"
+    );
+
+    const alphaChecked = await accSvc.checkSlot(alpha.id);
+    const betaChecked = await accSvc.checkSlot(beta.id);
+
+    accSlotCreateCheckOk =
+      hasDefault &&
+      hasProviders &&
+      alpha.status === "unknown" &&
+      alphaSignedOut.status === "signed_out" &&
+      alphaChecked.status === "ready" &&
+      alphaChecked.email === "alpha@example.com" &&
+      betaChecked.status === "ready" &&
+      betaChecked.email === "beta@example.com";
+
+    accQuotaParseOk =
+      alphaChecked.models.length === 2 &&
+      alphaChecked.quota.length === 2 &&
+      alphaChecked.quota[0]?.group === "Gemini Models" &&
+      alphaChecked.quota[0]?.remainingPct === 97 &&
+      alphaChecked.quota[0]?.resetAt === "2026-12-01T08:57:55Z" &&
+      alphaChecked.credits === 1250;
+
+    // Model PATCH validation
+    let invalidModelRejected = false;
+    try {
+      accSvc.patchSlot(alpha.id, { model: "non-existent-model" });
+    } catch (err) {
+      invalidModelRejected = err instanceof AccountsError && err.status === 400;
+    }
+    const patchedAlpha = accSvc.patchSlot(alpha.id, {
+      model: "gemini-2.5-pro",
+      effort: "high",
+    });
+    accModelPatchOk =
+      invalidModelRejected &&
+      patchedAlpha.model === "gemini-2.5-pro" &&
+      patchedAlpha.effort === "high";
+
+    // Rotation test: mark alpha exhausted, run job starting on alpha -> rotates to beta
+    writeFileSync(join(alpha.homeDir, ".stub_exhausted"), "1", "utf8");
+    const createdJob = accSvc.createJob({
+      prompt: "verify rotation test",
+      cwd: process.cwd(),
+      slotId: alpha.id,
+    });
+    const finishedJob = await accSvc.waitForJob(createdJob.jobId);
+    const alphaAfter = accSvc.getSlot(alpha.id);
+    const betaAfter = accSvc.getSlot(beta.id);
+
+    accRotationCooldownOk =
+      finishedJob?.status === "done" &&
+      finishedJob.slotId === beta.id &&
+      finishedJob.attempts.length === 2 &&
+      finishedJob.attempts[0]?.slotId === alpha.id &&
+      finishedJob.attempts[0]?.outcome === "quota_exhausted" &&
+      finishedJob.attempts[1]?.slotId === beta.id &&
+      finishedJob.attempts[1]?.outcome === "done" &&
+      alphaAfter?.status === "cooldown" &&
+      alphaAfter.cooldownUntil === "2099-12-31T23:59:59Z" &&
+      Boolean(alphaAfter.lastQuotaError);
+
+    accUsageCountedOk =
+      betaAfter?.measured.requests === 1 &&
+      betaAfter.measured.totalTokens === 215 &&
+      Boolean(betaAfter.measured.lastJobAt);
+
+    accDb.close();
+  } finally {
+    try {
+      rmSync(tempAccRoot, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+
   const recentCount = db.listRecentEvents(5).length;
   db.close();
 
@@ -260,7 +437,12 @@ if (args.has("--verify")) {
       libWriteOk &&
       libEscapeRejectedOk &&
       libSyncSkippedOk &&
-      auditRuleOk,
+      auditRuleOk &&
+      accSlotCreateCheckOk &&
+      accQuotaParseOk &&
+      accModelPatchOk &&
+      accRotationCooldownOk &&
+      accUsageCountedOk,
     adapters: {
       antigravity: agyHealth,
       cursor: cursorHealth,
@@ -283,6 +465,13 @@ if (args.has("--verify")) {
       libEscapeRejectedOk,
       libSyncSkippedOk,
       auditRuleOk,
+    },
+    accountsHub: {
+      accSlotCreateCheckOk,
+      accQuotaParseOk,
+      accModelPatchOk,
+      accRotationCooldownOk,
+      accUsageCountedOk,
     },
   };
   console.log(JSON.stringify(report, null, 2));
@@ -313,6 +502,18 @@ const auditService = new AuditService(library, db, (report) => {
   broadcastWs({ type: "audit_report", report });
 });
 auditService.startScheduler();
+
+const accountsService = new AccountsService({
+  db,
+  orchestrator,
+  onAccountsChanged: () => {
+    broadcastWs({ type: "accounts_changed" });
+  },
+  onJobUpdate: (job) => {
+    broadcastWs({ type: "agy_job", job });
+  },
+});
+accountsService.startScheduler();
 
 const server = Bun.serve({
   hostname: HOST,
@@ -351,7 +552,7 @@ const server = Bun.serve({
         status: 204,
         headers: {
           ...headers,
-          "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+          "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
           "access-control-allow-headers": "content-type",
         },
       });
@@ -505,6 +706,140 @@ const server = Bun.serve({
       return new Response(JSON.stringify(result, null, 2), { headers });
     }
 
+    if (url.pathname === "/api/accounts" && req.method === "GET") {
+      return new Response(JSON.stringify(accountsService.getAccounts(), null, 2), { headers });
+    }
+
+    if (url.pathname === "/api/accounts/slots" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as { name?: string } | null;
+      if (!body || typeof body !== "object") {
+        return jsonError(400, "Invalid JSON body");
+      }
+      try {
+        const slot = accountsService.createSlot({ name: body.name ?? "" });
+        return new Response(JSON.stringify(slot, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const slotCheckMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/check$/);
+    if (slotCheckMatch && req.method === "POST") {
+      try {
+        const slot = await accountsService.checkSlot(decodeURIComponent(slotCheckMatch[1]));
+        return new Response(JSON.stringify(slot, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const slotSignInMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/signin$/);
+    if (slotSignInMatch && req.method === "POST") {
+      const body = (await req.json().catch(() => ({}))) as { openTerminal?: boolean };
+      try {
+        const result = accountsService.signInSlot(
+          decodeURIComponent(slotSignInMatch[1]),
+          Boolean(body?.openTerminal)
+        );
+        return new Response(JSON.stringify(result, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const slotIdMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)$/);
+    if (slotIdMatch && req.method === "PATCH") {
+      const body = (await req.json().catch(() => null)) as {
+        name?: string;
+        model?: string | null;
+        effort?: SlotEffort;
+        enabled?: boolean;
+        manual?: { limitNote?: string; resetRule?: string };
+      } | null;
+      if (!body || typeof body !== "object") {
+        return jsonError(400, "Invalid JSON body");
+      }
+      try {
+        const slot = accountsService.patchSlot(decodeURIComponent(slotIdMatch[1]), body);
+        return new Response(JSON.stringify(slot, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (slotIdMatch && req.method === "DELETE") {
+      const purge = url.searchParams.get("purge") === "1";
+      try {
+        const result = accountsService.deleteSlot(decodeURIComponent(slotIdMatch[1]), purge);
+        return new Response(JSON.stringify(result, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const providerIdMatch = url.pathname.match(/^\/api\/accounts\/providers\/([^/]+)$/);
+    if (providerIdMatch && req.method === "PATCH") {
+      const body = (await req.json().catch(() => null)) as {
+        usedPct?: number | null;
+        sharePct?: number | null;
+        resetAt?: string | null;
+        resetRule?: string | null;
+        limitNote?: string | null;
+        note?: string | null;
+        source?: "manual" | "provider_snapshot";
+      } | null;
+      if (!body || typeof body !== "object") {
+        return jsonError(400, "Invalid JSON body");
+      }
+      try {
+        const row = accountsService.patchProvider(decodeURIComponent(providerIdMatch[1]), body);
+        return new Response(JSON.stringify(row, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (url.pathname === "/api/agy/jobs" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        prompt?: string;
+        cwd?: string;
+        slotId?: string;
+        model?: string;
+        effort?: SlotEffort;
+        autoEdit?: boolean;
+      } | null;
+      if (!body || typeof body !== "object") {
+        return jsonError(400, "Invalid JSON body");
+      }
+      try {
+        const result = accountsService.createJob({
+          prompt: body.prompt ?? "",
+          cwd: body.cwd ?? "",
+          slotId: body.slotId,
+          model: body.model,
+          effort: body.effort,
+          autoEdit: body.autoEdit,
+        });
+        return new Response(JSON.stringify(result, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const agyJobMatch = url.pathname.match(/^\/api\/agy\/jobs\/([^/]+)$/);
+    if (agyJobMatch && req.method === "GET") {
+      const job = accountsService.getJob(decodeURIComponent(agyJobMatch[1]));
+      if (!job) return jsonError(404, "Job not found");
+      return new Response(JSON.stringify(job, null, 2), { headers });
+    }
+
     if (url.pathname === "/api/vault/status") {
       return new Response(
         JSON.stringify(
@@ -534,6 +869,14 @@ const server = Bun.serve({
       "/api/events",
       "/api/approvals",
       "/api/stop-all",
+      "/api/accounts",
+      "/api/accounts/slots",
+      "/api/accounts/slots/:id",
+      "/api/accounts/slots/:id/check",
+      "/api/accounts/slots/:id/signin",
+      "/api/accounts/providers/:id",
+      "/api/agy/jobs",
+      "/api/agy/jobs/:id",
       "/api/vault/status",
       "/ws",
     ];
