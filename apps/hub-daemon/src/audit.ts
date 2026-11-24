@@ -250,7 +250,6 @@ export class AuditService {
       proc = Bun.spawn(
         [
           agyBin,
-          "--print",
           "--output-format",
           "text",
           "--effort",
@@ -259,7 +258,8 @@ export class AuditService {
           "plan",
           "--print-timeout",
           "120s",
-          prompt,
+          // agy needs the prompt attached to --print (a bare --print swallows the next flag).
+          `--print=${prompt}`,
         ],
         {
           stdout: "pipe",

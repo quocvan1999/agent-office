@@ -320,6 +320,18 @@ const server = Bun.serve({
   async fetch(req, srv) {
     const url = new URL(req.url);
 
+    // Local-only guard: browsers send Origin; only the local UI (localhost/127.0.0.1) may call the Hub.
+    const origin = req.headers.get("origin");
+    const originOk = !origin || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
+    const host = (req.headers.get("host") ?? "").replace(/:\d+$/, "");
+    const hostOk = host === "127.0.0.1" || host === "localhost";
+    if (!originOk || !hostOk) {
+      return new Response(JSON.stringify({ error: "Origin not allowed" }), {
+        status: 403,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
     if (url.pathname === "/ws") {
       if (srv.upgrade(req)) return;
       return new Response("WebSocket upgrade failed", { status: 400 });
@@ -327,7 +339,8 @@ const server = Bun.serve({
 
     const headers = {
       "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
+      "access-control-allow-origin": origin ?? "http://127.0.0.1:5173",
+      vary: "Origin",
     };
 
     const jsonError = (status: number, error: string) =>

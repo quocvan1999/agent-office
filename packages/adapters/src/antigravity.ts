@@ -67,8 +67,7 @@ export class AntigravityAdapter implements AgentAdapter {
 
     const sessionId = opts.conversationId ?? `agy-${opts.taskId}-${Date.now()}`;
     const args = [
-      "--print",
-      opts.prompt,
+      `--print=${opts.prompt}`,
       "--output-format",
       "stream-json",
       "--effort",
