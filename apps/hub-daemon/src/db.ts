@@ -93,6 +93,94 @@ export class OfficeDatabase {
         total_tokens INTEGER NOT NULL DEFAULT 0,
         last_job_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS org_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS org_departments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        head_agent_id TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS org_roles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        department_id TEXT NOT NULL,
+        default_provider TEXT NOT NULL,
+        default_effort TEXT NOT NULL,
+        system_prompt TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS org_agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        department_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        slot_id TEXT,
+        model TEXT,
+        effort TEXT NOT NULL DEFAULT 'low',
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'offline',
+        bridge TEXT NOT NULL DEFAULT 'none',
+        note TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS bus_conversations (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        participants_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        turn_cap INTEGER NOT NULL DEFAULT 12,
+        turns INTEGER NOT NULL DEFAULT 0,
+        created_by TEXT NOT NULL,
+        task_id TEXT,
+        summary TEXT,
+        pause_reason TEXT,
+        opened_at INTEGER NOT NULL,
+        closed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_bus_conv_status_opened ON bus_conversations(status, opened_at);
+
+      CREATE TABLE IF NOT EXISTS bus_messages (
+        id TEXT PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        from_agent_id TEXT NOT NULL,
+        to_agent_id TEXT,
+        conversation_id TEXT NOT NULL,
+        task_id TEXT,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        body TEXT,
+        token_estimate INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        reject_reason TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_bus_msg_conv_ts ON bus_messages(conversation_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_bus_msg_ts ON bus_messages(ts);
+
+      CREATE TABLE IF NOT EXISTS org_tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        from_agent_id TEXT NOT NULL,
+        department_id TEXT NOT NULL,
+        to_agent_id TEXT,
+        summary TEXT NOT NULL,
+        decisions_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        conversation_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_org_tasks_created ON org_tasks(created_at);
     `);
   }
 
@@ -325,6 +413,301 @@ export class OfficeDatabase {
       );
   }
 
+  getOrgMeta(key: string): string | null {
+    const row = this.db
+      .prepare(`SELECT value FROM org_meta WHERE key = ?`)
+      .get(key) as { value?: string } | null;
+    return row?.value ?? null;
+  }
+
+  setOrgMeta(key: string, value: string): void {
+    this.db
+      .prepare(`INSERT OR REPLACE INTO org_meta (key, value) VALUES (?, ?)`)
+      .run(key, value);
+  }
+
+  listOrgDepartments(): OrgDepartmentDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM org_departments ORDER BY rowid ASC`)
+      .all() as OrgDepartmentDbRow[];
+  }
+
+  getOrgDepartment(id: string): OrgDepartmentDbRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM org_departments WHERE id = ?`)
+        .get(id) as OrgDepartmentDbRow | null) ?? null
+    );
+  }
+
+  insertOrgDepartmentIfNotExists(row: OrgDepartmentDbRow): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO org_departments (id, name, head_agent_id) VALUES (?, ?, ?)`
+      )
+      .run(row.id, row.name, row.head_agent_id);
+  }
+
+  updateOrgDepartmentHead(id: string, headAgentId: string | null): void {
+    this.db
+      .prepare(`UPDATE org_departments SET head_agent_id = ? WHERE id = ?`)
+      .run(headAgentId, id);
+  }
+
+  clearOrgDepartmentHeadForAgent(agentId: string): void {
+    this.db
+      .prepare(`UPDATE org_departments SET head_agent_id = NULL WHERE head_agent_id = ?`)
+      .run(agentId);
+  }
+
+  listOrgRoles(): OrgRoleDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM org_roles ORDER BY rowid ASC`)
+      .all() as OrgRoleDbRow[];
+  }
+
+  getOrgRole(id: string): OrgRoleDbRow | null {
+    return (
+      (this.db.prepare(`SELECT * FROM org_roles WHERE id = ?`).get(id) as OrgRoleDbRow | null) ??
+      null
+    );
+  }
+
+  insertOrgRoleIfNotExists(row: OrgRoleDbRow): void {
+    this.db
+      .prepare(`
+        INSERT OR IGNORE INTO org_roles (
+          id, name, department_id, default_provider, default_effort, system_prompt
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.name,
+        row.department_id,
+        row.default_provider,
+        row.default_effort,
+        row.system_prompt
+      );
+  }
+
+  listOrgAgents(): OrgAgentDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM org_agents ORDER BY rowid ASC`)
+      .all() as OrgAgentDbRow[];
+  }
+
+  getOrgAgent(id: string): OrgAgentDbRow | null {
+    return (
+      (this.db.prepare(`SELECT * FROM org_agents WHERE id = ?`).get(id) as OrgAgentDbRow | null) ??
+      null
+    );
+  }
+
+  insertOrgAgentIfNotExists(row: OrgAgentDbRow): void {
+    this.db
+      .prepare(`
+        INSERT OR IGNORE INTO org_agents (
+          id, name, department_id, role_id, kind, provider, slot_id, model, effort, is_admin, status, bridge, note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.name,
+        row.department_id,
+        row.role_id,
+        row.kind,
+        row.provider,
+        row.slot_id,
+        row.model,
+        row.effort,
+        row.is_admin,
+        row.status,
+        row.bridge,
+        row.note
+      );
+  }
+
+  upsertOrgAgent(row: OrgAgentDbRow): void {
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO org_agents (
+          id, name, department_id, role_id, kind, provider, slot_id, model, effort, is_admin, status, bridge, note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.name,
+        row.department_id,
+        row.role_id,
+        row.kind,
+        row.provider,
+        row.slot_id,
+        row.model,
+        row.effort,
+        row.is_admin,
+        row.status,
+        row.bridge,
+        row.note
+      );
+  }
+
+  deleteOrgAgent(id: string): void {
+    this.db.prepare(`DELETE FROM org_agents WHERE id = ?`).run(id);
+  }
+
+  insertBusConversation(row: BusConversationDbRow): void {
+    this.db
+      .prepare(`
+        INSERT INTO bus_conversations (
+          id, type, title, participants_json, status, turn_cap, turns, created_by,
+          task_id, summary, pause_reason, opened_at, closed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.type,
+        row.title,
+        row.participants_json,
+        row.status,
+        row.turn_cap,
+        row.turns,
+        row.created_by,
+        row.task_id,
+        row.summary,
+        row.pause_reason,
+        row.opened_at,
+        row.closed_at
+      );
+  }
+
+  updateBusConversation(row: BusConversationDbRow): void {
+    this.db
+      .prepare(`
+        UPDATE bus_conversations
+        SET title = ?, participants_json = ?, status = ?, turn_cap = ?, turns = ?,
+            task_id = ?, summary = ?, pause_reason = ?, closed_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        row.title,
+        row.participants_json,
+        row.status,
+        row.turn_cap,
+        row.turns,
+        row.task_id,
+        row.summary,
+        row.pause_reason,
+        row.closed_at,
+        row.id
+      );
+  }
+
+  getBusConversation(id: string): BusConversationDbRow | null {
+    return (
+      (this.db
+        .prepare(`SELECT * FROM bus_conversations WHERE id = ?`)
+        .get(id) as BusConversationDbRow | null) ?? null
+    );
+  }
+
+  listBusConversations(status?: string): BusConversationDbRow[] {
+    if (status && status !== "all") {
+      return this.db
+        .prepare(`SELECT * FROM bus_conversations WHERE status = ? ORDER BY opened_at DESC`)
+        .all(status) as BusConversationDbRow[];
+    }
+    return this.db
+      .prepare(`SELECT * FROM bus_conversations ORDER BY opened_at DESC`)
+      .all() as BusConversationDbRow[];
+  }
+
+  insertBusMessage(row: BusMessageDbRow): void {
+    this.db
+      .prepare(`
+        INSERT INTO bus_messages (
+          id, ts, from_agent_id, to_agent_id, conversation_id, task_id,
+          kind, summary, body, token_estimate, status, reject_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.ts,
+        row.from_agent_id,
+        row.to_agent_id,
+        row.conversation_id,
+        row.task_id,
+        row.kind,
+        row.summary,
+        row.body,
+        row.token_estimate,
+        row.status,
+        row.reject_reason
+      );
+  }
+
+  listBusMessages(opts: {
+    conversationId?: string;
+    limit?: number;
+    includeRejected?: boolean;
+    order?: "asc" | "desc";
+  }): BusMessageDbRow[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.conversationId) {
+      clauses.push("conversation_id = ?");
+      params.push(opts.conversationId);
+    }
+    if (!opts.includeRejected) {
+      clauses.push("status = 'delivered'");
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const dir = opts.order === "asc" ? "ASC" : "DESC";
+    const limit = Math.max(1, Math.min(1000, opts.limit ?? 100));
+    params.push(limit);
+    return this.db
+      .prepare(`SELECT * FROM bus_messages ${where} ORDER BY ts ${dir}, rowid ${dir} LIMIT ?`)
+      .all(...params) as BusMessageDbRow[];
+  }
+
+  getLastDeliveredBusMessage(conversationId: string): BusMessageDbRow | null {
+    return (
+      (this.db
+        .prepare(
+          `SELECT * FROM bus_messages WHERE conversation_id = ? AND status = 'delivered' ORDER BY ts DESC, rowid DESC LIMIT 1`
+        )
+        .get(conversationId) as BusMessageDbRow | null) ?? null
+    );
+  }
+
+  insertOrgTask(row: OrgTaskDbRow): void {
+    this.db
+      .prepare(`
+        INSERT INTO org_tasks (
+          id, title, kind, from_agent_id, department_id, to_agent_id,
+          summary, decisions_json, status, conversation_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.title,
+        row.kind,
+        row.from_agent_id,
+        row.department_id,
+        row.to_agent_id,
+        row.summary,
+        row.decisions_json,
+        row.status,
+        row.conversation_id,
+        row.created_at
+      );
+  }
+
+  listOrgTasks(limit = 200): OrgTaskDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM org_tasks ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(limit) as OrgTaskDbRow[];
+  }
+
   close() {
     this.db.close();
   }
@@ -370,4 +753,80 @@ export interface ProviderDbRow {
   note: string | null;
   source: string;
   updated_at: string | null;
+}
+
+export interface OrgDepartmentDbRow {
+  id: string;
+  name: string;
+  head_agent_id: string | null;
+}
+
+export interface OrgRoleDbRow {
+  id: string;
+  name: string;
+  department_id: string;
+  default_provider: string;
+  default_effort: string;
+  system_prompt: string;
+}
+
+export interface OrgAgentDbRow {
+  id: string;
+  name: string;
+  department_id: string;
+  role_id: string;
+  kind: string;
+  provider: string;
+  slot_id: string | null;
+  model: string | null;
+  effort: string;
+  is_admin: number;
+  status: string;
+  bridge: string;
+  note: string | null;
+}
+
+export interface BusConversationDbRow {
+  id: string;
+  type: string;
+  title: string;
+  participants_json: string;
+  status: string;
+  turn_cap: number;
+  turns: number;
+  created_by: string;
+  task_id: string | null;
+  summary: string | null;
+  pause_reason: string | null;
+  opened_at: number;
+  closed_at: number | null;
+}
+
+export interface BusMessageDbRow {
+  id: string;
+  ts: number;
+  from_agent_id: string;
+  to_agent_id: string | null;
+  conversation_id: string;
+  task_id: string | null;
+  kind: string;
+  summary: string;
+  body: string | null;
+  token_estimate: number;
+  status: string;
+  reject_reason: string | null;
+}
+
+export interface OrgTaskDbRow {
+  id: string;
+  title: string;
+  kind: string;
+  from_agent_id: string;
+  department_id: string;
+  to_agent_id: string | null;
+  summary: string;
+  decisions_json: string;
+  status: string;
+  conversation_id: string | null;
+  created_at: number;
 }

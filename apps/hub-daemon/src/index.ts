@@ -17,16 +17,26 @@ import {
   CursorAdapter,
 } from "../../../packages/adapters/src/index.ts";
 import type { AgentEvent } from "../../../packages/protocol/src/events.ts";
+import type {
+  AgentBridge,
+  AgentKind,
+  AgentOrgProvider,
+  BusMessageKind,
+  OrgAgentStatus,
+  OrgEffort,
+} from "../../../packages/protocol/src/org.ts";
 import {
   AccountsError,
   AccountsService,
   type SlotEffort,
 } from "./accounts.ts";
 import { AuditRateLimitError, AuditService } from "./audit.ts";
+import { BusError, BusService } from "./bus.ts";
 import { OfficeDatabase } from "./db.ts";
 import { runDiscovery, scanKnowledgeHub } from "./discovery.ts";
 import { KnowledgeLibrary, LibraryError } from "./library.ts";
 import { HubOrchestrator } from "./orchestrator.ts";
+import { OrgError, OrgService, resolveActorId } from "./org.ts";
 import { lintKnowledgeBudget, loadPolicies, TaskGuard } from "./policy.ts";
 import { SecretsVault } from "./vault.ts";
 import { WorktreeManager } from "./worktree.ts";
@@ -79,7 +89,13 @@ for arg in "$@"; do
         echo 'AGY_ERROR: {"short_error":"Quota exhausted until 2099-12-31T23:59:59Z","status":"RESOURCE_EXHAUSTED","retryable":false,"reason":"QUOTA_EXHAUSTED"}' >&2
         exit 1
       else
-        echo '{"type":"result","result":{"usage":{"input_tokens":120,"output_tokens":80,"thinking_tokens":10,"cache_read_tokens":5,"total_tokens":215}}}'
+        CNT_FILE="${tempAccRoot}/.stub_turn_count"
+        CNT=1
+        if [ -f "$CNT_FILE" ]; then
+          CNT=$(($(cat "$CNT_FILE") + 1))
+        fi
+        echo "$CNT" > "$CNT_FILE"
+        printf '{"type":"result","result":{"text":"Stub summary turn #%s.\\\\nChi tiet phan hoi stub agy luot #%s.","usage":{"input_tokens":120,"output_tokens":80,"thinking_tokens":10,"cache_read_tokens":5,"total_tokens":215}}}\\n' "$CNT" "$CNT"
         exit 0
       fi
       ;;
@@ -410,6 +426,279 @@ exit 0
       Boolean(betaAfter.measured.lastJobAt);
 
     accDb.close();
+  } catch (err) {
+    console.error("Accounts verify error:", err);
+  }
+
+  // 7. Verify Org, Message Bus, Meeting Room, Guardrails, Handoff & Run (temp DB + stub agy)
+  let orgSeedOk = false;
+  let orgSameDeptDirectOk = false;
+  let orgCrossDeptRejectedOk = false;
+  let orgCrossDeptMeetingOk = false;
+  let orgNonParticipantRejectedOk = false;
+  let orgHandoffOk = false;
+  let orgHeadAssignOk = false;
+  let orgNonAdminStopAllOk = false;
+  let orgTurnCapOk = false;
+  let orgLoopGuardOk = false;
+  let orgMeetingRunOk = false;
+  const tempOrgDbPath = join(tempAccRoot, "org-verify.sqlite");
+  try {
+    const orgDb = new OfficeDatabase(tempOrgDbPath);
+    const orgOrch = new HubOrchestrator(orgDb);
+    const orgAcc = new AccountsService({
+      db: orgDb,
+      orchestrator: orgOrch,
+      agyBin: stubAgyBin,
+      profilesRoot: tempProfilesRoot,
+      quotaRefreshMin: 0,
+      repoRoot: process.cwd(),
+    });
+    const guardrailEvents: Array<{ conversationId: string; reason: string }> = [];
+    const orgSvc = new OrgService({ db: orgDb });
+    const busSvc = new BusService({
+      db: orgDb,
+      org: orgSvc,
+      accounts: orgAcc,
+      orchestrator: orgOrch,
+      repoRoot: process.cwd(),
+      onGuardrail: (conversationId, reason) => {
+        guardrailEvents.push({ conversationId, reason });
+      },
+    });
+
+    // 7.1 Seed present
+    const snapshot = orgSvc.getOrg();
+    const baAgent = orgSvc.getAgent("ba-agy-1");
+    const beAgent = orgSvc.getAgent("be-agy-1");
+    const lyVan = orgSvc.getAgent("ly-van");
+    const baHead = orgSvc.getAgent("chuyen-gia-ba");
+    orgSeedOk =
+      snapshot.departments.length === 11 &&
+      snapshot.roles.length === 11 &&
+      snapshot.agents.length === 10 &&
+      Boolean(lyVan?.isAdmin && lyVan.isHead && lyVan.kind === "human") &&
+      Boolean(baHead?.isHead && !baHead.isAdmin) &&
+      Boolean(baAgent?.bridge === "hub" && baAgent.departmentId === "ba") &&
+      Boolean(beAgent?.bridge === "hub" && beAgent.departmentId === "backend");
+
+    // 7.2 Same-dept direct OK
+    const sameDeptMsg = busSvc.postMessage({
+      fromAgentId: "ba-agy-1",
+      toAgentId: "chuyen-gia-ba",
+      kind: "request",
+      summary: "Xin xac nhan pham vi nghiep vu",
+      body: "Can chot danh sach API truoc khi chuyen Backend.",
+    });
+    orgSameDeptDirectOk =
+      sameDeptMsg.status === "delivered" &&
+      Boolean(sameDeptMsg.conversationId) &&
+      sameDeptMsg.tokenEstimate > 0;
+
+    // 7.3 Cross-dept direct rejected + logged
+    let crossRejectedStatus = 0;
+    let crossRejectedReason = "";
+    try {
+      busSvc.postMessage({
+        fromAgentId: "ba-agy-1",
+        toAgentId: "be-agy-1",
+        kind: "request",
+        summary: "Nhan truc tiep xuyen phong ban",
+      });
+    } catch (err) {
+      if (err instanceof BusError) {
+        crossRejectedStatus = err.status;
+        crossRejectedReason = err.reason ?? "";
+      }
+    }
+    const loggedMessages = busSvc.listMessages({ includeRejected: true, limit: 50 });
+    orgCrossDeptRejectedOk =
+      crossRejectedStatus === 403 &&
+      crossRejectedReason === "cross_department_direct_not_allowed" &&
+      loggedMessages.some(
+        (m) =>
+          m.status === "rejected" &&
+          m.fromAgentId === "ba-agy-1" &&
+          m.toAgentId === "be-agy-1" &&
+          m.rejectReason === "cross_department_direct_not_allowed"
+      );
+
+    // 7.4 Cross-dept via meeting OK
+    const meeting = busSvc.createConversation("chuyen-gia-ba", {
+      type: "meeting",
+      title: "Hop chot contract BA-BE",
+      participants: ["ba-agy-1", "be-agy-1"],
+      turnCap: 12,
+    });
+    const m1 = busSvc.postMessage({
+      fromAgentId: "ba-agy-1",
+      toAgentId: "be-agy-1",
+      conversationId: meeting.id,
+      kind: "meeting",
+      summary: "BA de xuat schema Org va Bus",
+    });
+    const m2 = busSvc.postMessage({
+      fromAgentId: "be-agy-1",
+      toAgentId: "ba-agy-1",
+      conversationId: meeting.id,
+      kind: "meeting",
+      summary: "BE dong y va bo sung chi muc sqlite",
+    });
+    orgCrossDeptMeetingOk = m1.status === "delivered" && m2.status === "delivered";
+
+    // 7.5 Non-participant rejected
+    let nonPartStatus = 0;
+    try {
+      busSvc.postMessage({
+        fromAgentId: "hacker-lo",
+        conversationId: meeting.id,
+        kind: "meeting",
+        summary: "Toi khong o trong phong hop nay",
+      });
+    } catch (err) {
+      if (err instanceof BusError) nonPartStatus = err.status;
+    }
+    orgNonParticipantRejectedOk =
+      nonPartStatus === 403 &&
+      busSvc
+        .listMessages({ conversationId: meeting.id, includeRejected: true })
+        .some(
+          (m) =>
+            m.status === "rejected" &&
+            m.fromAgentId === "hacker-lo" &&
+            m.rejectReason === "sender_not_participant"
+        );
+
+    // 7.6 Handoff creates conversation + task with summary only
+    const handoffRes = busSvc.handoffTask("ba-agy-1", {
+      title: "Ban giao spec ORG-HUB",
+      toDepartmentId: "backend",
+      summary: "Da chot contract phong ban va bus",
+      decisions: ["Dung sqlite", "Khong them dependency moi"],
+    });
+    orgHandoffOk =
+      handoffRes.kind === "handoff" &&
+      handoffRes.status === "handed_off" &&
+      handoffRes.conversationId === handoffRes.conversation.id &&
+      handoffRes.conversation.type === "handoff" &&
+      handoffRes.message.kind === "handoff" &&
+      handoffRes.message.status === "delivered" &&
+      (handoffRes.message.body?.length ?? 0) <= 1500 &&
+      handoffRes.decisions.length === 2;
+
+    // 7.7 Head assigns in own dept OK, other dept 403
+    const ownAssign = busSvc.assignTask("chuyen-gia-ba", {
+      title: "Viet tai lieu BA",
+      departmentId: "ba",
+      toAgentId: "ba-agy-1",
+      summary: "Hoan thien tai lieu phan tich",
+    });
+    let otherDeptAssignStatus = 0;
+    try {
+      busSvc.assignTask("chuyen-gia-ba", {
+        title: "Giao viec sai phong",
+        departmentId: "backend",
+        toAgentId: "be-agy-1",
+        summary: "Khong duoc phep",
+      });
+    } catch (err) {
+      if (err instanceof BusError) otherDeptAssignStatus = err.status;
+    }
+    orgHeadAssignOk = ownAssign.status === "assigned" && otherDeptAssignStatus === 403;
+
+    // 7.8 Non-admin stop-all 403
+    let nonAdminStatus = 0;
+    try {
+      orgSvc.requireAdmin("ba-agy-1");
+    } catch (err) {
+      if (err instanceof OrgError) nonAdminStatus = err.status;
+    }
+    const defaultActorIsAdmin = orgSvc.isAdmin(resolveActorId(null));
+    orgNonAdminStopAllOk = nonAdminStatus === 403 && defaultActorIsAdmin;
+
+    // 7.9 Turn cap closes with summary
+    const capConv = busSvc.createConversation("ly-van", {
+      type: "meeting",
+      title: "Hop test turn cap",
+      participants: ["ba-agy-1", "be-agy-1"],
+      turnCap: 3,
+    });
+    busSvc.postMessage({
+      fromAgentId: "ba-agy-1",
+      conversationId: capConv.id,
+      kind: "meeting",
+      summary: "Luot mot tu BA",
+    });
+    busSvc.postMessage({
+      fromAgentId: "be-agy-1",
+      conversationId: capConv.id,
+      kind: "meeting",
+      summary: "Luot hai tu BE",
+    });
+    busSvc.postMessage({
+      fromAgentId: "ba-agy-1",
+      conversationId: capConv.id,
+      kind: "meeting",
+      summary: "Luot ba chot van de",
+    });
+    const capAfter = busSvc.getConversationWithMessages(capConv.id);
+    orgTurnCapOk =
+      capAfter?.status === "closed" &&
+      Boolean(capAfter.summary && capAfter.summary.includes("Luot mot tu BA")) &&
+      Boolean(capAfter.closedAt) &&
+      guardrailEvents.some(
+        (g) => g.conversationId === capConv.id && g.reason === "turn_cap_reached"
+      );
+
+    // 7.10 Loop guard pauses
+    const loopConv = busSvc.createConversation("ly-van", {
+      type: "meeting",
+      title: "Hop test loop guard",
+      participants: ["ba-agy-1", "be-agy-1"],
+      turnCap: 10,
+    });
+    for (let i = 0; i < 3; i++) {
+      busSvc.postMessage({
+        fromAgentId: i % 2 === 0 ? "ba-agy-1" : "be-agy-1",
+        conversationId: loopConv.id,
+        kind: "meeting",
+        summary: "Noi dung lap y het nhau",
+      });
+    }
+    const loopAfter = busSvc.getConversationWithMessages(loopConv.id);
+    orgLoopGuardOk =
+      loopAfter?.status === "paused" &&
+      Boolean(loopAfter.pauseReason && loopAfter.pauseReason.includes("loop_guard")) &&
+      guardrailEvents.some(
+        (g) => g.conversationId === loopConv.id && g.reason.includes("loop_guard")
+      );
+
+    // 7.11 run() with 2 hub agents (ba-agy-1, be-agy-1) produces meeting messages from stub
+    const runConv = busSvc.createConversation("ly-van", {
+      type: "meeting",
+      title: "Hop tu dong 2 agent hub",
+      participants: ["ba-agy-1", "be-agy-1", "chuyen-gia-ba"],
+      turnCap: 12,
+    });
+    const runStarted = busSvc.startMeetingRun(runConv.id, {
+      rounds: 1,
+      prompt: "Chot ke hoach trien khai ORG-HUB",
+    });
+    const runFinished = await busSvc.waitForRun(runStarted.runId);
+    const runConvAfter = busSvc.getConversationWithMessages(runConv.id);
+    const defaultSlotAfter = orgAcc.getSlot("default");
+    const runDelivered = (runConvAfter?.messages ?? []).filter((m) => m.status === "delivered");
+    orgMeetingRunOk =
+      runStarted.ok &&
+      runFinished?.status === "done" &&
+      runDelivered.length === 2 &&
+      runDelivered[0]?.fromAgentId === "ba-agy-1" &&
+      runDelivered[1]?.fromAgentId === "be-agy-1" &&
+      (runFinished.skippedParticipants.some((s) => s.agentId === "chuyen-gia-ba") ?? false) &&
+      (defaultSlotAfter?.measured.requests ?? 0) >= 2 &&
+      (defaultSlotAfter?.measured.totalTokens ?? 0) >= 430;
+
+    orgDb.close();
   } finally {
     try {
       rmSync(tempAccRoot, { recursive: true, force: true });
@@ -442,7 +731,18 @@ exit 0
       accQuotaParseOk &&
       accModelPatchOk &&
       accRotationCooldownOk &&
-      accUsageCountedOk,
+      accUsageCountedOk &&
+      orgSeedOk &&
+      orgSameDeptDirectOk &&
+      orgCrossDeptRejectedOk &&
+      orgCrossDeptMeetingOk &&
+      orgNonParticipantRejectedOk &&
+      orgHandoffOk &&
+      orgHeadAssignOk &&
+      orgNonAdminStopAllOk &&
+      orgTurnCapOk &&
+      orgLoopGuardOk &&
+      orgMeetingRunOk,
     adapters: {
       antigravity: agyHealth,
       cursor: cursorHealth,
@@ -472,6 +772,19 @@ exit 0
       accModelPatchOk,
       accRotationCooldownOk,
       accUsageCountedOk,
+    },
+    orgHub: {
+      orgSeedOk,
+      orgSameDeptDirectOk,
+      orgCrossDeptRejectedOk,
+      orgCrossDeptMeetingOk,
+      orgNonParticipantRejectedOk,
+      orgHandoffOk,
+      orgHeadAssignOk,
+      orgNonAdminStopAllOk,
+      orgTurnCapOk,
+      orgLoopGuardOk,
+      orgMeetingRunOk,
     },
   };
   console.log(JSON.stringify(report, null, 2));
@@ -515,6 +828,33 @@ const accountsService = new AccountsService({
 });
 accountsService.startScheduler();
 
+const orgService = new OrgService({
+  db,
+  onOrgChanged: () => {
+    broadcastWs({ type: "org_changed" });
+  },
+});
+
+const busService = new BusService({
+  db,
+  org: orgService,
+  accounts: accountsService,
+  orchestrator,
+  repoRoot: process.cwd(),
+  onBusMessage: (message) => {
+    broadcastWs({ type: "bus_message", message });
+  },
+  onBusRejected: (message) => {
+    broadcastWs({ type: "bus_rejected", message });
+  },
+  onConversationChanged: (conversation) => {
+    broadcastWs({ type: "conversation_changed", conversation });
+  },
+  onGuardrail: (conversationId, reason) => {
+    broadcastWs({ type: "guardrail", conversationId, reason });
+  },
+});
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
@@ -544,8 +884,10 @@ const server = Bun.serve({
       vary: "Origin",
     };
 
-    const jsonError = (status: number, error: string) =>
-      new Response(JSON.stringify({ error }), { status, headers });
+    const jsonError = (status: number, error: string, reason?: string) =>
+      new Response(JSON.stringify(reason ? { error, reason } : { error }), { status, headers });
+
+    const actorId = resolveActorId(req.headers.get("x-actor-id"));
 
     if (req.method === "OPTIONS") {
       return new Response(null, {
@@ -553,7 +895,7 @@ const server = Bun.serve({
         headers: {
           ...headers,
           "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-          "access-control-allow-headers": "content-type",
+          "access-control-allow-headers": "content-type, x-actor-id",
         },
       });
     }
@@ -689,6 +1031,12 @@ const server = Bun.serve({
     }
 
     if (url.pathname.startsWith("/api/approvals/") && req.method === "POST") {
+      try {
+        orgService.requireAdmin(actorId);
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(403, "Admin permission required");
+      }
       const id = url.pathname.split("/")[3];
       const body = (await req.json().catch(() => ({}))) as { approved?: boolean };
       const resolved = orchestrator.resolveApproval(id, Boolean(body.approved));
@@ -702,6 +1050,12 @@ const server = Bun.serve({
     }
 
     if (url.pathname === "/api/stop-all" && req.method === "POST") {
+      try {
+        orgService.requireAdmin(actorId);
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(403, "Admin permission required");
+      }
       const result = await orchestrator.stopAll("Stopped by user from UI");
       return new Response(JSON.stringify(result, null, 2), { headers });
     }
@@ -855,6 +1209,284 @@ const server = Bun.serve({
       );
     }
 
+    // --- Org Registry ---
+    if (url.pathname === "/api/org" && req.method === "GET") {
+      return new Response(JSON.stringify(orgService.getOrg(), null, 2), { headers });
+    }
+
+    if (url.pathname === "/api/org/agents" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        id?: string;
+        name?: string;
+        departmentId?: string;
+        roleId?: string;
+        kind?: AgentKind;
+        provider?: AgentOrgProvider;
+        slotId?: string | null;
+        model?: string | null;
+        effort?: OrgEffort;
+        isAdmin?: boolean;
+        status?: OrgAgentStatus;
+        bridge?: AgentBridge;
+        note?: string | null;
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const agent = orgService.createAgent(actorId, {
+          id: body.id,
+          name: body.name ?? "",
+          departmentId: body.departmentId ?? "",
+          roleId: body.roleId ?? "",
+          kind: body.kind,
+          provider: body.provider,
+          slotId: body.slotId,
+          model: body.model,
+          effort: body.effort,
+          isAdmin: body.isAdmin,
+          status: body.status,
+          bridge: body.bridge,
+          note: body.note,
+        });
+        return new Response(JSON.stringify(agent, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const orgAgentMatch = url.pathname.match(/^\/api\/org\/agents\/([^/]+)$/);
+    if (orgAgentMatch && req.method === "PATCH") {
+      const body = (await req.json().catch(() => null)) as {
+        name?: string;
+        departmentId?: string;
+        roleId?: string;
+        kind?: AgentKind;
+        provider?: AgentOrgProvider;
+        slotId?: string | null;
+        model?: string | null;
+        effort?: OrgEffort;
+        isAdmin?: boolean;
+        status?: OrgAgentStatus;
+        bridge?: AgentBridge;
+        note?: string | null;
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const agent = orgService.patchAgent(actorId, decodeURIComponent(orgAgentMatch[1]), body);
+        return new Response(JSON.stringify(agent, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (orgAgentMatch && req.method === "DELETE") {
+      try {
+        const result = orgService.deleteAgent(actorId, decodeURIComponent(orgAgentMatch[1]));
+        return new Response(JSON.stringify(result, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const orgDeptMatch = url.pathname.match(/^\/api\/org\/departments\/([^/]+)$/);
+    if (orgDeptMatch && req.method === "PATCH") {
+      const body = (await req.json().catch(() => null)) as { headAgentId?: string | null } | null;
+      if (!body || typeof body !== "object" || !("headAgentId" in body)) {
+        return jsonError(400, "headAgentId is required");
+      }
+      try {
+        const dept = orgService.patchDepartment(actorId, decodeURIComponent(orgDeptMatch[1]), {
+          headAgentId: body.headAgentId ?? null,
+        });
+        return new Response(JSON.stringify(dept, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof OrgError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    // --- Message Bus ---
+    if (url.pathname === "/api/bus/messages" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        fromAgentId?: string;
+        toAgentId?: string | null;
+        conversationId?: string | null;
+        taskId?: string | null;
+        kind?: BusMessageKind;
+        summary?: string;
+        body?: string | null;
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const msg = busService.postMessage({
+          fromAgentId: body.fromAgentId ?? actorId,
+          toAgentId: body.toAgentId,
+          conversationId: body.conversationId,
+          taskId: body.taskId,
+          kind: body.kind as BusMessageKind,
+          summary: body.summary ?? "",
+          body: body.body,
+        });
+        return new Response(JSON.stringify(msg, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (url.pathname === "/api/bus/messages" && req.method === "GET") {
+      const conversationId = url.searchParams.get("conversationId") || undefined;
+      const rawLimit = Number(url.searchParams.get("limit") ?? 100);
+      const limit = Number.isFinite(rawLimit) ? rawLimit : 100;
+      const includeRejected = url.searchParams.get("includeRejected") !== "0";
+      const msgs = busService.listMessages({ conversationId, limit, includeRejected });
+      return new Response(JSON.stringify(msgs, null, 2), { headers });
+    }
+
+    // --- Conversations (Meeting Room) ---
+    if (url.pathname === "/api/conversations" && req.method === "GET") {
+      const status = url.searchParams.get("status") || "all";
+      return new Response(JSON.stringify(busService.listConversations(status), null, 2), {
+        headers,
+      });
+    }
+
+    if (url.pathname === "/api/conversations" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        type?: "meeting" | "direct" | "handoff";
+        title?: string;
+        participants?: string[];
+        turnCap?: number;
+        taskId?: string | null;
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const conv = busService.createConversation(actorId, {
+          type: body.type ?? "meeting",
+          title: body.title ?? "",
+          participants: body.participants ?? [],
+          turnCap: body.turnCap,
+          taskId: body.taskId,
+        });
+        return new Response(JSON.stringify(conv, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const convCloseMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/close$/);
+    if (convCloseMatch && req.method === "POST") {
+      const body = (await req.json().catch(() => ({}))) as { summary?: string };
+      try {
+        const conv = busService.closeConversation(
+          actorId,
+          decodeURIComponent(convCloseMatch[1]),
+          body?.summary
+        );
+        return new Response(JSON.stringify(conv, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const convResumeMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/resume$/);
+    if (convResumeMatch && req.method === "POST") {
+      try {
+        const conv = busService.resumeConversation(actorId, decodeURIComponent(convResumeMatch[1]));
+        return new Response(JSON.stringify(conv, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const convRunMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)\/run$/);
+    if (convRunMatch && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        rounds?: number;
+        prompt?: string;
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const res = busService.startMeetingRun(decodeURIComponent(convRunMatch[1]), {
+          rounds: body.rounds,
+          prompt: body.prompt ?? "",
+        });
+        return new Response(JSON.stringify(res, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const convIdMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)$/);
+    if (convIdMatch && req.method === "GET") {
+      const conv = busService.getConversationWithMessages(decodeURIComponent(convIdMatch[1]));
+      if (!conv) return jsonError(404, "Conversation not found");
+      return new Response(JSON.stringify(conv, null, 2), { headers });
+    }
+
+    // --- Tasks (Assign & Handoff) ---
+    if (url.pathname === "/api/tasks/assign" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        title?: string;
+        departmentId?: string;
+        toAgentId?: string | null;
+        summary?: string;
+        decisions?: string[];
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const task = busService.assignTask(actorId, {
+          title: body.title ?? "",
+          departmentId: body.departmentId ?? "",
+          toAgentId: body.toAgentId,
+          summary: body.summary ?? "",
+          decisions: body.decisions,
+        });
+        return new Response(JSON.stringify(task, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (url.pathname === "/api/tasks/handoff" && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as {
+        title?: string;
+        fromAgentId?: string;
+        departmentId?: string;
+        toDepartmentId?: string;
+        toAgentId?: string | null;
+        summary?: string;
+        decisions?: string[];
+      } | null;
+      if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body");
+      try {
+        const result = busService.handoffTask(actorId, {
+          title: body.title ?? "",
+          fromAgentId: body.fromAgentId,
+          departmentId: body.departmentId,
+          toDepartmentId: body.toDepartmentId,
+          toAgentId: body.toAgentId,
+          summary: body.summary ?? "",
+          decisions: body.decisions,
+        });
+        return new Response(JSON.stringify(result, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof BusError) return jsonError(err.status, err.message, err.reason);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    if (url.pathname === "/api/tasks" && req.method === "GET") {
+      return new Response(JSON.stringify(busService.listTasks(), null, 2), { headers });
+    }
+
     const endpoints = [
       "/health",
       "/api/discovery",
@@ -878,6 +1510,19 @@ const server = Bun.serve({
       "/api/agy/jobs",
       "/api/agy/jobs/:id",
       "/api/vault/status",
+      "/api/org",
+      "/api/org/agents",
+      "/api/org/agents/:id",
+      "/api/org/departments/:id",
+      "/api/bus/messages",
+      "/api/conversations",
+      "/api/conversations/:id",
+      "/api/conversations/:id/close",
+      "/api/conversations/:id/resume",
+      "/api/conversations/:id/run",
+      "/api/tasks",
+      "/api/tasks/assign",
+      "/api/tasks/handoff",
       "/ws",
     ];
     if (HUB_DEV) endpoints.push("/api/dev/test-approval");
