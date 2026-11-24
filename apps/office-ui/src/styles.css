@@ -44,6 +44,8 @@ code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12p
 .btn { border: 1px solid var(--border); background: #21262d; color: var(--text); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.ok { border-color: #1f6f43; color: var(--ok); }
+.btn.primary { background: #1f6feb; border-color: #388bfd; color: #fff; font-weight: 600; }
+.btn.primary:hover:not(:disabled) { background: #388bfd; }
 .btn.danger { border-color: #8a2a2b; color: #ff8080; }
 .btn.danger.strong { background: #b42318; color: #fff; border-color: #b42318; font-weight: 600; }
 .btn.ghost { background: transparent; }
@@ -181,8 +183,10 @@ code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12p
 .accounts-section { display: flex; flex-direction: column; gap: 10px; }
 .accounts-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .accounts-section-head h3 { margin: 0; font-size: 15px; }
+.add-slot-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .add-slot-form { display: flex; gap: 6px; align-items: center; }
 .add-slot-form .input { width: 230px; }
+.inline-validation { color: var(--block); font-size: 12px; }
 .small-input { padding: 4px 8px; font-size: 12.5px; }
 .tiny { font-size: 11px; }
 
@@ -229,6 +233,14 @@ code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12p
 .manual-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: center; }
 
 .signin-box { background: #121720; border: 1px solid #2f5d9f; border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.web-signin-box { gap: 8px; }
+.web-signin-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.web-signin-code-form { display: flex; gap: 6px; align-items: center; }
+.web-signin-code-form .input { flex: 1; }
+.signin-fallback-link { color: var(--accent); text-decoration: none; }
+.signin-fallback-link:hover { text-decoration: underline; }
+.signin-error-log { border-color: #8a2a2b; color: #ffb3b3; }
+.manual-signin-details summary { cursor: pointer; user-select: none; }
 .signin-cmd { margin: 0; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 
 .slot-actions { display: flex; align-items: center; gap: 6px; padding-top: 8px; border-top: 1px solid #21262d; }

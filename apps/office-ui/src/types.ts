@@ -308,6 +308,45 @@ export interface SignInSlotResponse {
   opened: boolean;
 }
 
+export type SignInState =
+  | "starting"
+  | "awaiting_user"
+  | "verifying"
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "cancelled";
+
+export interface SignInSession {
+  slotId: string;
+  state: SignInState;
+  authUrl?: string;
+  message?: string;
+  startedAt: string;
+  updatedAt: string;
+  expiresAt: string;
+}
+
+export const SIGNIN_STATE_LABEL: Record<SignInState, string> = {
+  starting: "Đang khởi tạo…",
+  awaiting_user: "Chờ đăng nhập Google",
+  verifying: "Đang xác thực…",
+  completed: "Đăng nhập thành công",
+  failed: "Thất bại",
+  timeout: "Hết thời gian",
+  cancelled: "Đã hủy",
+};
+
+export const SIGNIN_STATE_COLOR: Record<SignInState, string> = {
+  starting: "#4f9dff",
+  awaiting_user: "#f1c40f",
+  verifying: "#4f9dff",
+  completed: "#2ecc71",
+  failed: "#ff4d4f",
+  timeout: "#ff8a00",
+  cancelled: "#8c8c8c",
+};
+
 export interface PatchProviderRequest {
   usedPct?: number | null;
   sharePct?: number | null;

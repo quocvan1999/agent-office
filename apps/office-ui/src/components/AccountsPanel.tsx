@@ -1,16 +1,22 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   HubHttpError,
+  cancelSlotSignIn,
   checkAccountSlot,
   createAccountSlot,
   deleteAccountSlot,
+  fetchSlotSignIn,
   isNotFoundError,
   patchAccountProvider,
   patchAccountSlot,
   signInAccountSlot,
+  startSlotSignIn,
+  submitSlotSignInCode,
   useClock,
 } from "../hub.ts";
 import {
+  SIGNIN_STATE_COLOR,
+  SIGNIN_STATE_LABEL,
   SLOT_EFFORTS,
   SLOT_STATUS_COLOR,
   SLOT_STATUS_LABEL,
@@ -19,6 +25,7 @@ import {
   type AccountsResponse,
   type PatchProviderRequest,
   type ProviderRow,
+  type SignInSession,
   type SlotEffort,
 } from "../types.ts";
 
@@ -71,20 +78,37 @@ function clampPct(v: number): number {
   return Math.max(0, Math.min(100, v));
 }
 
+function suggestNextSlotName(slots: AccountSlot[]): string {
+  const taken = new Set<string>();
+  for (const s of slots) {
+    taken.add(s.name.trim().toLowerCase());
+    taken.add(s.id.trim().toLowerCase());
+  }
+  let n = 2;
+  while (taken.has(`acc${n}`)) n += 1;
+  return `acc${n}`;
+}
+
 function SlotCard({
   slot,
+  signInSession,
   quotaLowPct,
   nowMs,
   online,
   onMutated,
+  onSignInSession,
+  onToast,
   onUnsupported,
   onError,
 }: {
   slot: AccountSlot;
+  signInSession: SignInSession | null;
   quotaLowPct: number;
   nowMs: number;
   online: boolean;
   onMutated: () => Promise<void>;
+  onSignInSession: (session: SignInSession) => void;
+  onToast: (msg: string) => void;
   onUnsupported: () => void;
   onError: (msg: string | null) => void;
 }) {
@@ -95,13 +119,15 @@ function SlotCard({
   const [limitNote, setLimitNote] = useState(slot.manual?.limitNote ?? "");
   const [resetRule, setResetRule] = useState(slot.manual?.resetRule ?? "");
 
-  const [signInOpen, setSignInOpen] = useState(false);
   const [signInCmd, setSignInCmd] = useState(slot.signInCommand);
   const [signInStatus, setSignInStatus] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [authCode, setAuthCode] = useState("");
+  const [codeError, setCodeError] = useState<string | null>(null);
 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [purgeDir, setPurgeDir] = useState(false);
+  const lastCompletedRef = useRef<string | null>(null);
 
   useEffect(() => {
     setDraftName(slot.name);
@@ -115,6 +141,35 @@ function SlotCard({
   useEffect(() => {
     setSignInCmd(slot.signInCommand);
   }, [slot.signInCommand]);
+
+  // Restore any active web sign-in session from Hub on mount
+  useEffect(() => {
+    if (!online || slot.isDefault) return;
+    if (slot.status !== "signed_out" && slot.status !== "unknown") return;
+    let cancelled = false;
+    fetchSlotSignIn(slot.id)
+      .then((session) => {
+        if (!cancelled && session) onSignInSession(session);
+      })
+      .catch(() => {
+        // ignore if hub does not yet support or offline
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [online, slot.id, slot.isDefault, slot.status, onSignInSession]);
+
+  // Notify once on sign-in completion & refresh slot info
+  useEffect(() => {
+    if (signInSession?.state !== "completed") return;
+    const key = `${signInSession.startedAt}:${signInSession.updatedAt}`;
+    if (lastCompletedRef.current === key) return;
+    lastCompletedRef.current = key;
+    setAuthCode("");
+    setCodeError(null);
+    onToast(`Đăng nhập Google thành công cho slot “${slot.name}”.`);
+    void onMutated();
+  }, [signInSession?.state, signInSession?.startedAt, signInSession?.updatedAt, slot.name, onToast, onMutated]);
 
   const manualDirty =
     limitNote !== (slot.manual?.limitNote ?? "") || resetRule !== (slot.manual?.resetRule ?? "");
@@ -147,21 +202,59 @@ function SlotCard({
     });
   };
 
-  const handleOpenSignIn = async () => {
-    setSignInOpen((v) => !v);
-    setSignInStatus(null);
-    if (!signInOpen) {
-      setBusy("signin");
-      onError(null);
-      try {
-        const res = await signInAccountSlot(slot.id, false);
-        setSignInCmd(res.command || slot.signInCommand);
-      } catch (e) {
-        if (isNotFoundError(e)) onUnsupported();
-        else onError(formatError(e));
-      } finally {
-        setBusy(null);
-      }
+  const handleStartGoogleSignIn = async () => {
+    setBusy("signin_start");
+    setCodeError(null);
+    setAuthCode("");
+    onError(null);
+    try {
+      const session = await startSlotSignIn(slot.id);
+      onSignInSession(session);
+    } catch (e) {
+      if (isNotFoundError(e)) onUnsupported();
+      else onError(formatError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSubmitCode = async (e: FormEvent) => {
+    e.preventDefault();
+    const trimmed = authCode.trim();
+    if (!trimmed) {
+      setCodeError("Vui lòng dán mã xác thực.");
+      return;
+    }
+    if (trimmed.length < 10 || trimmed.length > 2048 || /\s/.test(trimmed)) {
+      setCodeError("Mã xác thực không hợp lệ (10–2048 ký tự, không chứa khoảng trắng).");
+      return;
+    }
+    setBusy("signin_code");
+    setCodeError(null);
+    onError(null);
+    try {
+      const session = await submitSlotSignInCode(slot.id, trimmed);
+      onSignInSession(session);
+    } catch (e) {
+      if (isNotFoundError(e)) onUnsupported();
+      else setCodeError(formatError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleCancelGoogleSignIn = async () => {
+    setBusy("signin_cancel");
+    setCodeError(null);
+    onError(null);
+    try {
+      const session = await cancelSlotSignIn(slot.id);
+      onSignInSession(session);
+    } catch (e) {
+      if (isNotFoundError(e)) onUnsupported();
+      else onError(formatError(e));
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -197,6 +290,21 @@ function SlotCard({
 
   const cooldownLeft = slot.status === "cooldown" ? formatCountdown(slot.cooldownUntil, nowMs) : null;
   const statusColor = SLOT_STATUS_COLOR[slot.status];
+  const needsGoogleSignIn = !slot.isDefault && (slot.status === "signed_out" || slot.status === "unknown");
+  const isSignInActive =
+    signInSession != null &&
+    (signInSession.state === "starting" ||
+      signInSession.state === "awaiting_user" ||
+      signInSession.state === "verifying");
+  const showWebSignInBox =
+    isSignInActive ||
+    (needsGoogleSignIn &&
+      signInSession != null &&
+      (signInSession.state === "failed" ||
+        signInSession.state === "timeout" ||
+        signInSession.state === "cancelled"));
+  const signInExpiresLeft =
+    isSignInActive && signInSession ? formatCountdown(signInSession.expiresAt, nowMs) : null;
 
   return (
     <article className={`slot-card status-${slot.status} ${slot.enabled ? "" : "slot-disabled"}`}>
@@ -447,8 +555,100 @@ function SlotCard({
         </div>
       </div>
 
-      {signInOpen && (
-        <div className="signin-box">
+      {showWebSignInBox && signInSession && (
+        <div className="signin-box web-signin-box">
+          <div className="web-signin-head">
+            <span
+              className="slot-status-badge"
+              style={{ borderColor: SIGNIN_STATE_COLOR[signInSession.state] }}
+            >
+              <span className="dot" style={{ background: SIGNIN_STATE_COLOR[signInSession.state] }} />
+              <span>{SIGNIN_STATE_LABEL[signInSession.state]}</span>
+            </span>
+            {signInExpiresLeft && (
+              <span className="muted tiny">Hết hạn sau {signInExpiresLeft}</span>
+            )}
+          </div>
+
+          {signInSession.state === "starting" && (
+            <div className="muted small">Đang khởi tạo phiên đăng nhập Google cho slot này…</div>
+          )}
+
+          {(signInSession.state === "awaiting_user" || signInSession.state === "verifying") && (
+            <>
+              <div className="muted small">
+                Đăng nhập tài khoản Google cho slot này. Nếu trang hiện mã xác thực, dán vào ô dưới
+              </div>
+              {signInSession.authUrl && (
+                <div className="row compact" style={{ flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="btn small primary"
+                    onClick={() =>
+                      window.open(signInSession.authUrl, "_blank", "noopener,noreferrer")
+                    }
+                  >
+                    Mở trang đăng nhập Google
+                  </button>
+                  <a
+                    href={signInSession.authUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="signin-fallback-link small"
+                  >
+                    Mở liên kết trực tiếp ↗
+                  </a>
+                </div>
+              )}
+              <form className="web-signin-code-form" onSubmit={(e) => void handleSubmitCode(e)}>
+                <input
+                  type="text"
+                  className="input small-input"
+                  placeholder="Dán mã xác thực Google tại đây…"
+                  value={authCode}
+                  disabled={!online || busy !== null || signInSession.state === "verifying"}
+                  onChange={(e) => {
+                    setAuthCode(e.target.value);
+                    if (codeError) setCodeError(null);
+                  }}
+                />
+                <button
+                  type="submit"
+                  className="btn small ok"
+                  disabled={!online || busy !== null || signInSession.state === "verifying"}
+                >
+                  {busy === "signin_code" || signInSession.state === "verifying"
+                    ? "Đang xác nhận…"
+                    : "Xác nhận"}
+                </button>
+              </form>
+              {codeError && <div className="inline-validation">{codeError}</div>}
+            </>
+          )}
+
+          {(signInSession.state === "failed" || signInSession.state === "timeout") &&
+            signInSession.message && (
+              <pre className="signin-cmd signin-error-log">{signInSession.message}</pre>
+            )}
+
+          {isSignInActive && (
+            <div className="row compact">
+              <button
+                type="button"
+                className="btn ghost small danger"
+                disabled={!online || busy !== null}
+                onClick={() => void handleCancelGoogleSignIn()}
+              >
+                {busy === "signin_cancel" ? "Đang hủy…" : "Hủy"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      <details className="manual-signin-details">
+        <summary className="muted small">Cách thủ công</summary>
+        <div className="signin-box" style={{ marginTop: 6 }}>
           <div className="muted small">Chạy lệnh này trong Terminal rồi đăng nhập Google:</div>
           <pre className="signin-cmd">{signInCmd || "—"}</pre>
           <div className="row compact">
@@ -463,15 +663,22 @@ function SlotCard({
             >
               {busy === "terminal" ? "Đang mở…" : "Mở Terminal"}
             </button>
-            <button type="button" className="btn ghost small" onClick={() => setSignInOpen(false)}>
-              Đóng
-            </button>
           </div>
           {signInStatus && <div className="muted tiny">{signInStatus}</div>}
         </div>
-      )}
+      </details>
 
       <div className="slot-actions">
+        {needsGoogleSignIn && (
+          <button
+            type="button"
+            className="btn small primary"
+            disabled={!online || busy !== null || isSignInActive}
+            onClick={() => void handleStartGoogleSignIn()}
+          >
+            {busy === "signin_start" ? "Đang mở…" : "Đăng nhập Google"}
+          </button>
+        )}
         <button
           type="button"
           className="btn small ok"
@@ -483,14 +690,6 @@ function SlotCard({
           }
         >
           {busy === "check" ? "Đang kiểm tra…" : "Kiểm tra"}
-        </button>
-        <button
-          type="button"
-          className="btn small"
-          disabled={!online || busy !== null}
-          onClick={() => void handleOpenSignIn()}
-        >
-          Đăng nhập
         </button>
         <div className="spacer" />
         <button
@@ -565,28 +764,47 @@ function toProviderDraft(row: ProviderRow): ProviderEditDraft {
 
 export default function AccountsPanel({
   accounts,
+  signInSessions,
   unsupported,
   error,
   online,
   onRefresh,
+  onSignInSession,
+  onToast,
 }: {
   accounts: AccountsResponse | null;
+  signInSessions: Record<string, SignInSession>;
   unsupported: boolean;
   error: string | null;
   online: boolean;
   onRefresh: () => Promise<void>;
+  onSignInSession: (session: SignInSession) => void;
+  onToast: (msg: string) => void;
 }) {
   const nowMs = useClock(true, 1000);
   const [localUnsupported, setLocalUnsupported] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  const [newSlotName, setNewSlotName] = useState("");
+  const [newSlotName, setNewSlotName] = useState("acc2");
+  const [userEditedSlotName, setUserEditedSlotName] = useState(false);
+  const [addSlotError, setAddSlotError] = useState<string | null>(null);
   const [addingSlot, setAddingSlot] = useState(false);
 
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
   const [providerDraft, setProviderDraft] = useState<ProviderEditDraft | null>(null);
   const [savingProvider, setSavingProvider] = useState(false);
+
+  const slots = accounts?.slots ?? [];
+  const providers = accounts?.providers ?? [];
+  const quotaLowPct = accounts?.quotaLowPct ?? 20;
+
+  // Prefill suggested slot name (acc2, acc3...) whenever slots change if user hasn't manually edited
+  useEffect(() => {
+    if (!userEditedSlotName) {
+      setNewSlotName(suggestNextSlotName(slots));
+    }
+  }, [slots, userEditedSlotName]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -601,12 +819,24 @@ export default function AccountsPanel({
   const handleAddSlot = async (e: FormEvent) => {
     e.preventDefault();
     const name = newSlotName.trim();
-    if (!name) return;
+    if (!name) {
+      setAddSlotError("Vui lòng nhập tên slot.");
+      return;
+    }
+    const lower = name.toLowerCase();
+    const isDuplicate = slots.some(
+      (s) => s.name.trim().toLowerCase() === lower || s.id.trim().toLowerCase() === lower
+    );
+    if (isDuplicate) {
+      setAddSlotError(`Tên slot “${name}” đã tồn tại.`);
+      return;
+    }
     setAddingSlot(true);
+    setAddSlotError(null);
     setActionError(null);
     try {
       await createAccountSlot(name);
-      setNewSlotName("");
+      setUserEditedSlotName(false);
       await onRefresh();
     } catch (err) {
       if (isNotFoundError(err)) setLocalUnsupported(true);
@@ -676,18 +906,13 @@ export default function AccountsPanel({
     );
   }
 
-  const slots = accounts?.slots ?? [];
-  const providers = accounts?.providers ?? [];
-  const quotaLowPct = accounts?.quotaLowPct ?? 20;
-
   return (
     <div className="accounts-panel">
       <div className="accounts-help">
         <div>
           <strong>Cách thêm tài khoản Antigravity:</strong>{" "}
           <span className="muted">
-            Thêm slot → bấm <strong>Đăng nhập</strong> (chạy lệnh trong Terminal, đăng nhập Google) → bấm{" "}
-            <strong>Kiểm tra</strong>.
+            Thêm slot → bấm <strong>Đăng nhập Google</strong> (mở trang Google, dán mã nếu có) → hệ thống tự kiểm tra và nạp model/hạn mức.
           </span>
         </div>
         <button
@@ -715,23 +940,30 @@ export default function AccountsPanel({
       <section className="accounts-section">
         <div className="accounts-section-head">
           <h3>Antigravity (mỗi tài khoản 1 slot)</h3>
-          <form className="add-slot-form" onSubmit={(e) => void handleAddSlot(e)}>
-            <input
-              type="text"
-              className="input small-input"
-              placeholder="Tên slot mới (vd: work, personal)…"
-              value={newSlotName}
-              disabled={!online || addingSlot}
-              onChange={(e) => setNewSlotName(e.target.value)}
-            />
-            <button
-              type="submit"
-              className="btn ok small"
-              disabled={!online || addingSlot || !newSlotName.trim()}
-            >
-              {addingSlot ? "Đang thêm…" : "+ Thêm slot"}
-            </button>
-          </form>
+          <div className="add-slot-wrap">
+            <form className="add-slot-form" onSubmit={(e) => void handleAddSlot(e)}>
+              <input
+                type="text"
+                className="input small-input"
+                placeholder="Tên slot mới (vd: acc2, work)…"
+                value={newSlotName}
+                disabled={!online || addingSlot}
+                onChange={(e) => {
+                  setNewSlotName(e.target.value);
+                  setUserEditedSlotName(true);
+                  if (addSlotError) setAddSlotError(null);
+                }}
+              />
+              <button
+                type="submit"
+                className="btn ok small"
+                disabled={!online || addingSlot}
+              >
+                {addingSlot ? "Đang thêm…" : "+ Thêm slot"}
+              </button>
+            </form>
+            {addSlotError && <div className="inline-validation">{addSlotError}</div>}
+          </div>
         </div>
 
         {!accounts ? (
@@ -744,10 +976,13 @@ export default function AccountsPanel({
               <SlotCard
                 key={slot.id}
                 slot={slot}
+                signInSession={signInSessions[slot.id] ?? null}
                 quotaLowPct={quotaLowPct}
                 nowMs={nowMs}
                 online={online}
                 onMutated={onRefresh}
+                onSignInSession={onSignInSession}
+                onToast={onToast}
                 onUnsupported={() => setLocalUnsupported(true)}
                 onError={setActionError}
               />

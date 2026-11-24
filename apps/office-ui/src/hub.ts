@@ -34,6 +34,7 @@ import type {
   RunConversationResponse,
   SaveLibraryFileRequest,
   SaveLibraryFileResponse,
+  SignInSession,
   SignInSlotResponse,
   SyncResult,
   TaskRecord,
@@ -174,6 +175,31 @@ export function signInAccountSlot(id: string, openTerminal = false): Promise<Sig
   return postJson<SignInSlotResponse>(`/api/accounts/slots/${encodeURIComponent(id)}/signin`, {
     openTerminal,
   });
+}
+
+export function startSlotSignIn(id: string, force = false): Promise<SignInSession> {
+  return postJson<SignInSession>(
+    `/api/accounts/slots/${encodeURIComponent(id)}/signin/start`,
+    force ? { force: true } : {}
+  );
+}
+
+export function submitSlotSignInCode(id: string, code: string): Promise<SignInSession> {
+  return postJson<SignInSession>(`/api/accounts/slots/${encodeURIComponent(id)}/signin/code`, {
+    code,
+  });
+}
+
+export function cancelSlotSignIn(id: string): Promise<SignInSession> {
+  return postJson<SignInSession>(`/api/accounts/slots/${encodeURIComponent(id)}/signin/cancel`);
+}
+
+export async function fetchSlotSignIn(id: string): Promise<SignInSession | null> {
+  const data = await getJson<SignInSession | { session: null }>(
+    `/api/accounts/slots/${encodeURIComponent(id)}/signin`
+  );
+  if (data && "session" in data && data.session === null) return null;
+  return data as SignInSession;
 }
 
 export function patchAccountProvider(id: string, body: PatchProviderRequest): Promise<ProviderRow> {
@@ -329,6 +355,7 @@ export interface HubState {
   accounts: AccountsResponse | null;
   accountsUnsupported: boolean;
   accountsError: string | null;
+  signInSessions: Record<string, SignInSession>;
   org: OrgResponse | null;
   orgUnsupported: boolean;
   orgError: string | null;
@@ -342,6 +369,7 @@ export interface HubState {
   busRevision: number;
   lastGuardrail: GuardrailNotice | null;
   refreshAccounts: () => Promise<void>;
+  updateSignInSession: (session: SignInSession) => void;
   refreshOrg: () => Promise<void>;
   refreshConversations: () => Promise<void>;
   refreshTasks: () => Promise<void>;
@@ -370,6 +398,7 @@ export function useHub(): HubState {
   const [accounts, setAccounts] = useState<AccountsResponse | null>(null);
   const [accountsUnsupported, setAccountsUnsupported] = useState(false);
   const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [signInSessions, setSignInSessions] = useState<Record<string, SignInSession>>({});
   const [org, setOrg] = useState<OrgResponse | null>(null);
   const [orgUnsupported, setOrgUnsupported] = useState(false);
   const [orgError, setOrgError] = useState<string | null>(null);
@@ -541,6 +570,12 @@ export function useHub(): HubState {
           loadLint();
         } else if (data.type === "accounts_changed") {
           void loadAccounts();
+        } else if (data.type === "signin" && data.session && typeof data.session.slotId === "string") {
+          const session = data.session as SignInSession;
+          setSignInSessions((prev) => ({ ...prev, [session.slotId]: session }));
+          if (session.state === "completed") {
+            void loadAccounts();
+          }
         } else if (data.type === "bus_message" && data.message) {
           const m = data.message as BusMessage;
           setBusMessages((prev) => [m, ...prev.filter((x) => x.id !== m.id)].slice(0, MAX_BUS_MESSAGES));
@@ -644,6 +679,10 @@ export function useHub(): HubState {
     [loadLint]
   );
 
+  const updateSignInSession = useCallback((session: SignInSession) => {
+    setSignInSessions((prev) => ({ ...prev, [session.slotId]: session }));
+  }, []);
+
   const stopAll = useCallback(async () => {
     const result = await postJson<{ stoppedSessions: number; deniedApprovals: number }>(
       "/api/stop-all"
@@ -669,6 +708,7 @@ export function useHub(): HubState {
     accounts,
     accountsUnsupported,
     accountsError,
+    signInSessions,
     org,
     orgUnsupported,
     orgError,
@@ -682,6 +722,7 @@ export function useHub(): HubState {
     busRevision,
     lastGuardrail,
     refreshAccounts: loadAccounts,
+    updateSignInSession,
     refreshOrg: loadOrg,
     refreshConversations: loadConversations,
     refreshTasks: loadTasks,
