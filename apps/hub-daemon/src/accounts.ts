@@ -1306,7 +1306,10 @@ export class AccountsService {
             parsed.result && typeof parsed.result === "object"
               ? (parsed.result as Record<string, unknown>)
               : null;
-          if (res && typeof res.text === "string" && res.text.trim()) {
+          // agy 1.5 stream-json puts the final answer in result.response.
+          if (res && typeof res.response === "string" && res.response.trim()) {
+            textParts.push(res.response.trim());
+          } else if (res && typeof res.text === "string" && res.text.trim()) {
             textParts.push(res.text.trim());
           } else if (res && typeof res.output === "string" && res.output.trim()) {
             textParts.push(res.output.trim());
