@@ -170,3 +170,157 @@ export interface AuditReport {
 export interface TestApprovalResponse {
   approval: PendingApproval;
 }
+
+// Accounts & Quota
+export type AccountSource = "provider" | "measured" | "manual" | "provider_snapshot";
+export type ProviderSource = AccountSource | "none";
+
+export const SOURCE_LABEL: Record<ProviderSource, string> = {
+  provider: "từ nhà cung cấp",
+  measured: "tự đo",
+  manual: "nhập tay",
+  provider_snapshot: "ảnh chụp từ nhà cung cấp",
+  none: "chưa có dữ liệu",
+};
+
+export type SlotEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export const SLOT_EFFORTS: SlotEffort[] = ["low", "medium", "high", "xhigh", "max"];
+
+export type SlotStatus = "ready" | "cooldown" | "quota_low" | "signed_out" | "unknown";
+
+export const SLOT_STATUS_LABEL: Record<SlotStatus, string> = {
+  ready: "Sẵn sàng",
+  quota_low: "Hạn mức thấp",
+  cooldown: "Tạm nghỉ",
+  signed_out: "Chưa đăng nhập",
+  unknown: "Chưa rõ",
+};
+
+export const SLOT_STATUS_COLOR: Record<SlotStatus, string> = {
+  ready: "#2ecc71",
+  quota_low: "#f1c40f",
+  cooldown: "#ff8a00",
+  signed_out: "#8c8c8c",
+  unknown: "#6e7681",
+};
+
+export interface QuotaWindow {
+  group: string;
+  window: string;
+  remainingPct: number;
+  resetAt: string;
+  source: AccountSource;
+  fetchedAt: string;
+}
+
+export interface SlotModelOption {
+  id: string;
+  label: string;
+}
+
+export interface SlotMeasured {
+  requests: number;
+  totalTokens: number;
+  lastJobAt: string | null;
+  source: "measured";
+}
+
+export interface SlotQuotaError {
+  at: string;
+  message: string;
+}
+
+export interface SlotManual {
+  limitNote?: string;
+  resetRule?: string;
+}
+
+export interface AccountSlot {
+  id: string;
+  name: string;
+  homeDir: string;
+  isDefault: boolean;
+  enabled: boolean;
+  model: string | null;
+  effort: SlotEffort;
+  status: SlotStatus;
+  email: string | null;
+  models: SlotModelOption[];
+  quota: QuotaWindow[];
+  credits: number | null;
+  measured: SlotMeasured;
+  cooldownUntil: string | null;
+  lastQuotaError: SlotQuotaError | null;
+  manual: SlotManual;
+  lastCheckedAt: string | null;
+  signInCommand: string;
+}
+
+export type ProviderKind = "cursor" | "codex" | "grok_plan" | "grok_bot";
+
+export interface ProviderRow {
+  id: string;
+  label: string;
+  kind: ProviderKind;
+  detected?: string;
+  usedPct?: number | null;
+  sharePct?: number | null;
+  resetAt?: string | null;
+  resetRule?: string | null;
+  limitNote?: string | null;
+  note?: string | null;
+  source: ProviderSource;
+  updatedAt: string | null;
+}
+
+export interface AccountsResponse {
+  slots: AccountSlot[];
+  providers: ProviderRow[];
+  quotaLowPct: number;
+}
+
+export interface PatchSlotRequest {
+  name?: string;
+  model?: string | null;
+  effort?: SlotEffort;
+  enabled?: boolean;
+  manual?: SlotManual;
+}
+
+export interface SignInSlotResponse {
+  command: string;
+  opened: boolean;
+}
+
+export interface PatchProviderRequest {
+  usedPct?: number | null;
+  sharePct?: number | null;
+  resetAt?: string | null;
+  resetRule?: string | null;
+  limitNote?: string | null;
+  note?: string | null;
+  source?: "manual" | "provider_snapshot";
+}
+
+export interface AgyJobRequest {
+  prompt: string;
+  cwd: string;
+  slotId?: string;
+  model?: string;
+  effort?: SlotEffort;
+  autoEdit?: boolean;
+}
+
+export interface AgyJobCreateResponse {
+  jobId: string;
+  slotId: string;
+}
+
+export interface AgyJob {
+  id: string;
+  status: "queued" | "running" | "done" | "error" | "waiting_approval";
+  slotId: string;
+  attempts: Array<{ slotId: string; outcome: string }>;
+  usage?: Record<string, number>;
+  error?: unknown;
+}
