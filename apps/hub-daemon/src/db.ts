@@ -42,6 +42,15 @@ export class OfficeDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_events_task_ts ON events(task_id, ts);
+
+      CREATE TABLE IF NOT EXISTS audit_reports (
+        id TEXT PRIMARY KEY,
+        at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        report_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_reports_at ON audit_reports(at);
     `);
   }
 
@@ -85,6 +94,26 @@ export class OfficeDatabase {
       approvalId: r.approval_id ? String(r.approval_id) : undefined,
       telemetry: r.telemetry_json ? JSON.parse(String(r.telemetry_json)) : undefined,
     }));
+  }
+
+  saveAuditReport(report: { id: string; at: string; kind: string }) {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO audit_reports (id, at, kind, report_json)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(report.id, report.at, report.kind, JSON.stringify(report));
+  }
+
+  getLatestAuditReport<T>(): T | null {
+    const row = this.db
+      .prepare(`SELECT report_json FROM audit_reports ORDER BY at DESC LIMIT 1`)
+      .get() as { report_json?: string } | null;
+    if (!row?.report_json) return null;
+    try {
+      return JSON.parse(row.report_json) as T;
+    } catch {
+      return null;
+    }
   }
 
   close() {
