@@ -51,6 +51,48 @@ export class OfficeDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS idx_audit_reports_at ON audit_reports(at);
+
+      CREATE TABLE IF NOT EXISTS slots (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        home_dir TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        model TEXT,
+        effort TEXT NOT NULL DEFAULT 'medium',
+        status TEXT NOT NULL DEFAULT 'unknown',
+        email TEXT,
+        models_json TEXT NOT NULL DEFAULT '[]',
+        quota_json TEXT NOT NULL DEFAULT '[]',
+        credits REAL,
+        cooldown_until TEXT,
+        last_quota_error_json TEXT,
+        manual_json TEXT NOT NULL DEFAULT '{}',
+        last_checked_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS provider_rows (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        used_pct REAL,
+        share_pct REAL,
+        reset_at TEXT,
+        reset_rule TEXT,
+        limit_note TEXT,
+        note TEXT,
+        source TEXT NOT NULL DEFAULT 'none',
+        updated_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS slot_usage (
+        slot_id TEXT PRIMARY KEY,
+        requests INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        last_job_at TEXT
+      );
     `);
   }
 
@@ -116,7 +158,216 @@ export class OfficeDatabase {
     }
   }
 
+  listSlotRows(): SlotDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM slots ORDER BY is_default DESC, created_at ASC`)
+      .all() as SlotDbRow[];
+  }
+
+  getSlotRow(id: string): SlotDbRow | null {
+    return (this.db.prepare(`SELECT * FROM slots WHERE id = ?`).get(id) as SlotDbRow | null) ?? null;
+  }
+
+  insertSlotIfNotExists(row: SlotDbRow): boolean {
+    const res = this.db
+      .prepare(`
+        INSERT OR IGNORE INTO slots (
+          id, name, home_dir, is_default, enabled, model, effort, status, email,
+          models_json, quota_json, credits, cooldown_until, last_quota_error_json,
+          manual_json, last_checked_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.name,
+        row.home_dir,
+        row.is_default,
+        row.enabled,
+        row.model,
+        row.effort,
+        row.status,
+        row.email,
+        row.models_json,
+        row.quota_json,
+        row.credits,
+        row.cooldown_until,
+        row.last_quota_error_json,
+        row.manual_json,
+        row.last_checked_at,
+        row.created_at,
+        row.updated_at
+      );
+    return res.changes > 0;
+  }
+
+  upsertSlotRow(row: SlotDbRow): void {
+    this.db
+      .prepare(`
+        INSERT OR REPLACE INTO slots (
+          id, name, home_dir, is_default, enabled, model, effort, status, email,
+          models_json, quota_json, credits, cooldown_until, last_quota_error_json,
+          manual_json, last_checked_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.name,
+        row.home_dir,
+        row.is_default,
+        row.enabled,
+        row.model,
+        row.effort,
+        row.status,
+        row.email,
+        row.models_json,
+        row.quota_json,
+        row.credits,
+        row.cooldown_until,
+        row.last_quota_error_json,
+        row.manual_json,
+        row.last_checked_at,
+        row.created_at,
+        row.updated_at
+      );
+  }
+
+  deleteSlotRow(id: string): void {
+    this.db.prepare(`DELETE FROM slots WHERE id = ?`).run(id);
+    this.db.prepare(`DELETE FROM slot_usage WHERE slot_id = ?`).run(id);
+  }
+
+  listSlotUsage(): Map<string, SlotUsageRow> {
+    const rows = this.db
+      .prepare(`SELECT slot_id, requests, total_tokens, last_job_at FROM slot_usage`)
+      .all() as SlotUsageRow[];
+    const map = new Map<string, SlotUsageRow>();
+    for (const r of rows) {
+      map.set(r.slot_id, r);
+    }
+    return map;
+  }
+
+  getSlotUsage(slotId: string): SlotUsageRow {
+    const row = this.db
+      .prepare(`SELECT slot_id, requests, total_tokens, last_job_at FROM slot_usage WHERE slot_id = ?`)
+      .get(slotId) as SlotUsageRow | null;
+    return row ?? { slot_id: slotId, requests: 0, total_tokens: 0, last_job_at: null };
+  }
+
+  incrementSlotUsage(slotId: string, tokens: number, at: string): void {
+    this.db
+      .prepare(`
+        INSERT INTO slot_usage (slot_id, requests, total_tokens, last_job_at)
+        VALUES (?, 1, ?, ?)
+        ON CONFLICT(slot_id) DO UPDATE SET
+          requests = requests + 1,
+          total_tokens = total_tokens + excluded.total_tokens,
+          last_job_at = excluded.last_job_at
+      `)
+      .run(slotId, Math.max(0, Math.round(tokens)), at);
+  }
+
+  insertProviderRowIfNotExists(row: ProviderDbRow): void {
+    this.db
+      .prepare(`
+        INSERT OR IGNORE INTO provider_rows (
+          id, label, kind, used_pct, share_pct, reset_at, reset_rule, limit_note, note, source, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        row.id,
+        row.label,
+        row.kind,
+        row.used_pct,
+        row.share_pct,
+        row.reset_at,
+        row.reset_rule,
+        row.limit_note,
+        row.note,
+        row.source,
+        row.updated_at
+      );
+  }
+
+  listProviderRows(): ProviderDbRow[] {
+    return this.db
+      .prepare(`SELECT * FROM provider_rows ORDER BY rowid ASC`)
+      .all() as ProviderDbRow[];
+  }
+
+  getProviderRow(id: string): ProviderDbRow | null {
+    return (
+      (this.db.prepare(`SELECT * FROM provider_rows WHERE id = ?`).get(id) as ProviderDbRow | null) ??
+      null
+    );
+  }
+
+  updateProviderRow(row: ProviderDbRow): void {
+    this.db
+      .prepare(`
+        UPDATE provider_rows
+        SET label = ?, kind = ?, used_pct = ?, share_pct = ?, reset_at = ?,
+            reset_rule = ?, limit_note = ?, note = ?, source = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        row.label,
+        row.kind,
+        row.used_pct,
+        row.share_pct,
+        row.reset_at,
+        row.reset_rule,
+        row.limit_note,
+        row.note,
+        row.source,
+        row.updated_at,
+        row.id
+      );
+  }
+
   close() {
     this.db.close();
   }
+}
+
+export interface SlotDbRow {
+  id: string;
+  name: string;
+  home_dir: string;
+  is_default: number;
+  enabled: number;
+  model: string | null;
+  effort: string;
+  status: string;
+  email: string | null;
+  models_json: string;
+  quota_json: string;
+  credits: number | null;
+  cooldown_until: string | null;
+  last_quota_error_json: string | null;
+  manual_json: string;
+  last_checked_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SlotUsageRow {
+  slot_id: string;
+  requests: number;
+  total_tokens: number;
+  last_job_at: string | null;
+}
+
+export interface ProviderDbRow {
+  id: string;
+  label: string;
+  kind: string;
+  used_pct: number | null;
+  share_pct: number | null;
+  reset_at: string | null;
+  reset_rule: string | null;
+  limit_note: string | null;
+  note: string | null;
+  source: string;
+  updated_at: string | null;
 }
