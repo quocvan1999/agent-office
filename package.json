@@ -1,0 +1,15 @@
+{
+  "name": "agent-office",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local 3D Multi-Agent Office & Shared Knowledge Hub (~/.cursor)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:hub": "bun --watch apps/hub-daemon/src/index.ts",
+    "dev:ui": "bun run --cwd apps/office-ui dev",
+    "typecheck": "tsc --noEmit"
+  }
+}

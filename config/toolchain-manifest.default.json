@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "dataDir": "~/agent-office-data",
+  "knowledgeHubDir": "~/.cursor",
+  "tools": [
+    {
+      "id": "git",
+      "required": true,
+      "checkCmd": "git --version",
+      "purpose": "Task isolation via git worktree and repository tracking"
+    },
+    {
+      "id": "antigravity",
+      "required": false,
+      "binary": "agy",
+      "knownPaths": ["~/.gemini/bin/agy", "~/.antigravity/antigravity/bin/agy"],
+      "checkCmd": "agy --version",
+      "syncScript": "~/.cursor/scripts/sync-antigravity.sh"
+    },
+    {
+      "id": "cursor",
+      "required": false,
+      "binary": "agent",
+      "configDir": "~/.cursor",
+      "checkCmd": "agent --version"
+    },
+    {
+      "id": "codex",
+      "required": false,
+      "binary": "codex",
+      "configDir": "~/.codex",
+      "checkCmd": "codex --version"
+    }
+  ]
+}
