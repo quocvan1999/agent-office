@@ -97,6 +97,25 @@ export interface CreateAgyJobInput {
   autoEdit?: boolean;
 }
 
+export interface PinnedTurnInput {
+  slotId?: string | null;
+  prompt: string;
+  cwd?: string;
+  model?: string | null;
+  effort?: SlotEffort;
+  agentId?: string;
+  taskId?: string;
+  printTimeout?: string;
+}
+
+export interface PinnedTurnResult {
+  ok: boolean;
+  slotId: string;
+  text: string;
+  usage?: AgyUsage;
+  error?: string;
+}
+
 export interface AccountsServiceOptions {
   db: OfficeDatabase;
   orchestrator: HubOrchestrator;
@@ -1158,6 +1177,239 @@ export class AccountsService {
       job.error = result.errorText ?? `Exited with code ${result.exitCode}`;
       this.emitJobUpdate(job);
       return;
+    }
+  }
+
+  async runPinnedTurn(input: PinnedTurnInput): Promise<PinnedTurnResult> {
+    const slotId = input.slotId?.trim() || "default";
+    const row = this.db.getSlotRow(slotId);
+    if (!row) {
+      return { ok: false, slotId, text: "", error: `Slot not found: ${slotId}` };
+    }
+    const slot = this.hydrateSlot(row);
+    if (!slot.enabled) {
+      return { ok: false, slotId, text: "", error: `Slot is disabled: ${slotId}` };
+    }
+    if (slot.status === "signed_out") {
+      return { ok: false, slotId, text: "", error: `Slot is signed out: ${slotId}` };
+    }
+
+    const effectiveEffort: SlotEffort =
+      input.effort && VALID_EFFORTS.has(input.effort) ? input.effort : slot.effort ?? "low";
+    const effectiveModel = input.model ?? slot.model ?? undefined;
+    const printTimeout = input.printTimeout ?? "120s";
+    const cwd = input.cwd ?? this.repoRoot;
+    const agentId = input.agentId ?? `antigravity-${slot.id}`;
+    const taskId = input.taskId ?? `turn-${crypto.randomUUID().slice(0, 8)}`;
+
+    const args = [
+      `--print=${input.prompt}`,
+      "--output-format",
+      "stream-json",
+      "--mode",
+      "plan",
+      "--effort",
+      effectiveEffort,
+      "--print-timeout",
+      printTimeout,
+      "--sandbox",
+    ];
+    if (effectiveModel) args.push("--model", effectiveModel);
+
+    const env: Record<string, string | undefined> =
+      row.is_default === 1 ? { ...process.env } : { ...process.env, HOME: row.home_dir };
+
+    this.orchestrator.emit({
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      agentId,
+      provider: "antigravity",
+      taskId,
+      status: "thinking",
+      summary: `Meeting turn started (slot=${slot.id}, effort=${effectiveEffort})`,
+    });
+
+    const proc = Bun.spawn([this.agyBin, ...args], {
+      cwd,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+    }, 125_000);
+
+    try {
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      let usage: AgyUsage | undefined;
+      const textParts: string[] = [];
+      const errorLines: string[] = [];
+
+      const extractUsageFromObj = (rec: Record<string, unknown>): AgyUsage | undefined => {
+        const raw =
+          (rec.usage && typeof rec.usage === "object"
+            ? (rec.usage as Record<string, unknown>)
+            : null) ??
+          (rec.result &&
+          typeof rec.result === "object" &&
+          (rec.result as Record<string, unknown>).usage
+            ? ((rec.result as Record<string, unknown>).usage as Record<string, unknown>)
+            : null);
+        if (!raw) return undefined;
+        const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+        const input_tokens = num(raw.input_tokens);
+        const output_tokens = num(raw.output_tokens);
+        const thinking_tokens = num(raw.thinking_tokens);
+        const cache_read_tokens = num(raw.cache_read_tokens);
+        const total_tokens =
+          num(raw.total_tokens) ??
+          (input_tokens !== undefined || output_tokens !== undefined
+            ? (input_tokens ?? 0) + (output_tokens ?? 0) + (thinking_tokens ?? 0)
+            : undefined);
+        if (
+          input_tokens === undefined &&
+          output_tokens === undefined &&
+          thinking_tokens === undefined &&
+          cache_read_tokens === undefined &&
+          total_tokens === undefined
+        ) {
+          return undefined;
+        }
+        return { input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens };
+      };
+
+      for (const rawLine of stdout.split("\n")) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.includes("AGY_ERROR:")) {
+          errorLines.push(line);
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          const u = extractUsageFromObj(parsed);
+          if (u) usage = u;
+
+          const res =
+            parsed.result && typeof parsed.result === "object"
+              ? (parsed.result as Record<string, unknown>)
+              : null;
+          if (res && typeof res.text === "string" && res.text.trim()) {
+            textParts.push(res.text.trim());
+          } else if (res && typeof res.output === "string" && res.output.trim()) {
+            textParts.push(res.output.trim());
+          } else if (res && typeof res.message === "string" && res.message.trim()) {
+            textParts.push(res.message.trim());
+          } else if (typeof parsed.text === "string" && parsed.text.trim()) {
+            textParts.push(parsed.text.trim());
+          } else if (typeof parsed.delta === "string" && parsed.delta.trim()) {
+            textParts.push(parsed.delta.trim());
+          } else if (typeof parsed.content === "string" && parsed.content.trim()) {
+            textParts.push(parsed.content.trim());
+          } else if (
+            parsed.message &&
+            typeof parsed.message === "object" &&
+            typeof (parsed.message as Record<string, unknown>).content === "string"
+          ) {
+            const c = String((parsed.message as Record<string, unknown>).content).trim();
+            if (c) textParts.push(c);
+          }
+          if (parsed.type === "error" || parsed.error) {
+            errorLines.push(
+              typeof parsed.error === "string"
+                ? parsed.error
+                : typeof parsed.message === "string"
+                  ? parsed.message
+                  : line
+            );
+          }
+        } catch {
+          textParts.push(line);
+        }
+      }
+
+      for (const sLine of stderr.split("\n")) {
+        const t = sLine.trim();
+        if (t) errorLines.push(t);
+      }
+
+      const errorText = timedOut
+        ? `Timed out after ${printTimeout}`
+        : errorLines.length > 0
+          ? errorLines.join("\n")
+          : undefined;
+      const isQuotaError = Boolean(errorText && QUOTA_ERROR_RE.test(errorText));
+
+      if (exitCode === 0 && !isQuotaError && !timedOut) {
+        const now = new Date().toISOString();
+        const totalTokens = usage?.total_tokens ?? 0;
+        this.db.incrementSlotUsage(slot.id, totalTokens, now);
+        this.emitAccountsChanged();
+        this.orchestrator.emit({
+          id: crypto.randomUUID(),
+          ts: Date.now(),
+          agentId,
+          provider: "antigravity",
+          taskId,
+          status: "completed",
+          summary: "Meeting turn completed",
+        });
+        return {
+          ok: true,
+          slotId: slot.id,
+          text: textParts.join("\n").trim(),
+          usage,
+        };
+      }
+
+      if (isQuotaError) {
+        const now = new Date().toISOString();
+        const cooldownUntil = this.computeCooldownUntil(errorText, slot);
+        const latestRow = this.db.getSlotRow(slot.id);
+        if (latestRow) {
+          latestRow.cooldown_until = cooldownUntil;
+          latestRow.last_quota_error_json = JSON.stringify({
+            at: now,
+            message: (errorText ?? "RESOURCE_EXHAUSTED").slice(0, 500),
+          });
+          latestRow.status = "cooldown";
+          latestRow.updated_at = now;
+          this.db.upsertSlotRow(latestRow);
+        }
+        this.emitAccountsChanged();
+      }
+
+      this.orchestrator.emit({
+        id: crypto.randomUUID(),
+        ts: Date.now(),
+        agentId,
+        provider: "antigravity",
+        taskId,
+        status: "error",
+        summary: errorText ?? `Exited with code ${exitCode}`,
+      });
+
+      return {
+        ok: false,
+        slotId: slot.id,
+        text: textParts.join("\n").trim(),
+        usage,
+        error: errorText ?? `Exited with code ${exitCode}`,
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 }
