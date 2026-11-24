@@ -116,6 +116,8 @@ function extractGoogleAuthUrl(screenBuffer: string): string | null {
 }
 
 interface InternalSession {
+  /** When a URL was first seen on screen; the clean shim URL gets a grace period before the screen fallback is used. */
+  screenUrlSeenAt?: number;
   session: SignInSession;
   homeDir: string;
   shimDir: string;
@@ -276,8 +278,16 @@ export class SignInManager {
     if (internal.session.state !== "starting") return;
 
     const fromShim = this.readUrlFromShimFile(internal.urlFile);
-    const captured = fromShim ?? extractGoogleAuthUrl(internal.screenBuffer);
-    if (!captured) return;
+    let captured = fromShim;
+    if (!captured) {
+      // The screen copy of the URL is wrapped and may be mangled by TUI escapes; agy normally
+      // calls `open` (our shim) right after printing it, so wait up to 4 s for the clean copy.
+      const fromScreen = extractGoogleAuthUrl(internal.screenBuffer);
+      if (!fromScreen) return;
+      internal.screenUrlSeenAt ??= Date.now();
+      if (Date.now() - internal.screenUrlSeenAt < 4000) return;
+      captured = fromScreen;
+    }
 
     internal.session.state = "awaiting_user";
     internal.session.authUrl = captured;
