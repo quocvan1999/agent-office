@@ -7,6 +7,7 @@ import AgentPanel from "./components/AgentPanel.tsx";
 import SeatGrid2D from "./components/SeatGrid2D.tsx";
 import LibraryPanel from "./components/LibraryPanel.tsx";
 import AuditPanel from "./components/AuditPanel.tsx";
+import AccountsPanel from "./components/AccountsPanel.tsx";
 
 const Office3D = lazy(() => import("./components/Office3D.tsx"));
 const LS_KEY = "agent-office.powerSaver2D";
@@ -26,7 +27,7 @@ export default function App() {
   const hidden = usePageHidden();
   const [mode2D, setMode2D] = useState(() => localStorage.getItem(LS_KEY) === "1");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [workspaceTab, setWorkspaceTab] = useState<"library" | "audit" | null>(null);
+  const [workspaceTab, setWorkspaceTab] = useState<"library" | "audit" | "accounts" | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -51,7 +52,9 @@ export default function App() {
   const knownIds = useMemo(() => new Set(seats.map((s) => s.id)), [seats]);
   const selected = seats.find((s) => s.id === selectedId) ?? null;
   const online = hub.connection === "open";
-  const libraryOpen = workspaceTab !== null;
+  const libraryOpen = workspaceTab === "library" || workspaceTab === "audit";
+  const accountsOpen = workspaceTab === "accounts";
+  const accountSlots = hub.accounts?.slots ?? [];
 
   const doStopAll = async () => {
     setConfirmStop(false);
@@ -78,6 +81,9 @@ export default function App() {
         </div>
         <BudgetMeter lint={hub.lint} budget={hub.budget} />
         <div className="spacer" />
+        <button className="btn ghost" onClick={() => setWorkspaceTab("accounts")}>
+          ⚡ Tài khoản &amp; Hạn mức
+        </button>
         <button className="btn ghost" onClick={() => setWorkspaceTab("library")}>
           ▤ Thư viện
         </button>
@@ -99,6 +105,9 @@ export default function App() {
               onSelect={setSelectedId}
               libraryOpen={libraryOpen}
               onOpenLibrary={() => setWorkspaceTab("library")}
+              accountsOpen={accountsOpen}
+              onOpenAccounts={() => setWorkspaceTab("accounts")}
+              accountSlots={accountSlots}
             />
           ) : (
             <Suspense fallback={<div className="loading">Đang tải văn phòng 3D…</div>}>
@@ -108,6 +117,9 @@ export default function App() {
                 onSelect={setSelectedId}
                 libraryOpen={libraryOpen}
                 onOpenLibrary={() => setWorkspaceTab("library")}
+                accountsOpen={accountsOpen}
+                onOpenAccounts={() => setWorkspaceTab("accounts")}
+                accountSlots={accountSlots}
                 paused={hidden}
               />
             </Suspense>
@@ -180,6 +192,13 @@ export default function App() {
                 >
                   Kiểm toán (Audit)
                 </button>
+                <button
+                  type="button"
+                  className={`tab ${workspaceTab === "accounts" ? "active" : ""}`}
+                  onClick={() => setWorkspaceTab("accounts")}
+                >
+                  Tài khoản &amp; Hạn mức
+                </button>
               </div>
               <button className="btn ghost" onClick={() => setWorkspaceTab(null)} aria-label="Đóng">
                 ✕
@@ -194,12 +213,20 @@ export default function App() {
                   lastSyncResult={hub.lastSyncResult}
                   onSyncResult={hub.recordSyncResult}
                 />
-              ) : (
+              ) : workspaceTab === "audit" ? (
                 <AuditPanel
                   report={hub.auditReport}
                   unsupported={hub.auditUnsupported}
                   online={online}
                   onRunAudit={hub.runAuditReport}
+                />
+              ) : (
+                <AccountsPanel
+                  accounts={hub.accounts}
+                  unsupported={hub.accountsUnsupported}
+                  error={hub.accountsError}
+                  online={online}
+                  onRefresh={hub.refreshAccounts}
                 />
               )}
             </div>

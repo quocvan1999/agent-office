@@ -1,16 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  AccountSlot,
+  AccountsResponse,
   AgentEvent,
+  AgyJob,
+  AgyJobCreateResponse,
+  AgyJobRequest,
   AuditReport,
   ConnectionState,
   DiscoveryReport,
   KnowledgeLintReport,
   LibraryFileResponse,
   LibraryTreeResponse,
+  PatchProviderRequest,
+  PatchSlotRequest,
   PendingApproval,
   PolicyBudget,
+  ProviderRow,
   SaveLibraryFileRequest,
   SaveLibraryFileResponse,
+  SignInSlotResponse,
   SyncResult,
   TestApprovalResponse,
 } from "./types.ts";
@@ -34,7 +43,11 @@ export class HubHttpError extends Error {
   }
 }
 
-async function requestJson<T>(method: "GET" | "POST" | "PUT", path: string, body?: unknown): Promise<T> {
+async function requestJson<T>(
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown
+): Promise<T> {
   const res = await fetch(`${HUB_HTTP}${path}`, {
     method,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
@@ -63,6 +76,14 @@ function postJson<T>(path: string, body?: unknown): Promise<T> {
 
 function putJson<T>(path: string, body: unknown): Promise<T> {
   return requestJson<T>("PUT", path, body);
+}
+
+function patchJson<T>(path: string, body: unknown): Promise<T> {
+  return requestJson<T>("PATCH", path, body);
+}
+
+function deleteJson<T>(path: string): Promise<T> {
+  return requestJson<T>("DELETE", path);
 }
 
 export function isNotFoundError(err: unknown): boolean {
@@ -99,6 +120,56 @@ export function createDevTestApproval(action?: string): Promise<TestApprovalResp
   return postJson<TestApprovalResponse>("/api/dev/test-approval", action ? { action } : {});
 }
 
+export function fetchAccounts(): Promise<AccountsResponse> {
+  return getJson<AccountsResponse>("/api/accounts");
+}
+
+export function createAccountSlot(name: string): Promise<AccountSlot> {
+  return postJson<AccountSlot>("/api/accounts/slots", { name });
+}
+
+export function patchAccountSlot(id: string, body: PatchSlotRequest): Promise<AccountSlot> {
+  return patchJson<AccountSlot>(`/api/accounts/slots/${encodeURIComponent(id)}`, body);
+}
+
+export function deleteAccountSlot(id: string, purge = false): Promise<{ ok: boolean }> {
+  const suffix = purge ? "?purge=1" : "";
+  return deleteJson<{ ok: boolean }>(`/api/accounts/slots/${encodeURIComponent(id)}${suffix}`);
+}
+
+export function checkAccountSlot(id: string): Promise<AccountSlot> {
+  return postJson<AccountSlot>(`/api/accounts/slots/${encodeURIComponent(id)}/check`);
+}
+
+export function signInAccountSlot(id: string, openTerminal = false): Promise<SignInSlotResponse> {
+  return postJson<SignInSlotResponse>(`/api/accounts/slots/${encodeURIComponent(id)}/signin`, {
+    openTerminal,
+  });
+}
+
+export function patchAccountProvider(id: string, body: PatchProviderRequest): Promise<ProviderRow> {
+  return patchJson<ProviderRow>(`/api/accounts/providers/${encodeURIComponent(id)}`, body);
+}
+
+export function createAgyJob(body: AgyJobRequest): Promise<AgyJobCreateResponse> {
+  return postJson<AgyJobCreateResponse>("/api/agy/jobs", body);
+}
+
+export function fetchAgyJob(id: string): Promise<AgyJob> {
+  return getJson<AgyJob>(`/api/agy/jobs/${encodeURIComponent(id)}`);
+}
+
+export function useClock(enabled = true, intervalMs = 1000): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [enabled, intervalMs]);
+  return nowMs;
+}
+
 const MAX_EVENTS = 200;
 const DEFAULT_BUDGET: PolicyBudget = {
   alwaysOnWarnTokens: 15000,
@@ -120,6 +191,10 @@ export interface HubState {
   auditReport: AuditReport | null;
   auditUnsupported: boolean;
   lastSyncResult: SyncResult | null;
+  accounts: AccountsResponse | null;
+  accountsUnsupported: boolean;
+  accountsError: string | null;
+  refreshAccounts: () => Promise<void>;
   resolveApproval: (id: string, approved: boolean) => Promise<void>;
   createTestApproval: (action?: string) => Promise<TestApprovalResponse>;
   runAuditReport: (ai?: boolean) => Promise<AuditReport>;
@@ -142,6 +217,9 @@ export function useHub(): HubState {
   const [auditReport, setAuditReport] = useState<AuditReport | null>(null);
   const [auditUnsupported, setAuditUnsupported] = useState(false);
   const [lastSyncResult, setLastSyncResult] = useState<SyncResult | null>(null);
+  const [accounts, setAccounts] = useState<AccountsResponse | null>(null);
+  const [accountsUnsupported, setAccountsUnsupported] = useState(false);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
   const attempt = useRef(0);
 
   const loadApprovals = useCallback(() => {
@@ -169,10 +247,27 @@ export function useHub(): HubState {
       });
   }, []);
 
+  const loadAccounts = useCallback(async () => {
+    try {
+      const data = await fetchAccounts();
+      setAccounts(data);
+      setAccountsUnsupported(false);
+      setAccountsError(null);
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        setAccountsUnsupported(true);
+        setAccountsError(null);
+      } else {
+        setAccountsError(e instanceof HubHttpError && e.serverError ? e.serverError : String(e));
+      }
+    }
+  }, []);
+
   const refresh = useCallback(() => {
     loadApprovals();
     loadLint();
     loadAudit();
+    void loadAccounts();
     getJson<DiscoveryReport>("/api/discovery").then(setDiscovery).catch(() => {});
     getJson<{ knowledgeBudget?: PolicyBudget }>("/api/policy")
       .then((p) => p.knowledgeBudget && setBudget({ ...DEFAULT_BUDGET, ...p.knowledgeBudget }))
@@ -180,7 +275,7 @@ export function useHub(): HubState {
     getJson<AgentEvent[]>("/api/events")
       .then((list) => setEvents(list.slice(0, MAX_EVENTS)))
       .catch(() => {});
-  }, [loadApprovals, loadLint, loadAudit]);
+  }, [loadApprovals, loadLint, loadAudit, loadAccounts]);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -231,6 +326,8 @@ export function useHub(): HubState {
         } else if (data.type === "sync_result" && data.result) {
           setLastSyncResult(data.result as SyncResult);
           loadLint();
+        } else if (data.type === "accounts_changed") {
+          void loadAccounts();
         }
       };
 
@@ -271,7 +368,7 @@ export function useHub(): HubState {
       clearInterval(lintTimer);
       ws?.close();
     };
-  }, [refresh, loadApprovals, loadLint]);
+  }, [refresh, loadApprovals, loadLint, loadAccounts]);
 
   const resolveApproval = useCallback(
     async (id: string, approved: boolean) => {
@@ -327,6 +424,10 @@ export function useHub(): HubState {
     auditReport,
     auditUnsupported,
     lastSyncResult,
+    accounts,
+    accountsUnsupported,
+    accountsError,
+    refreshAccounts: loadAccounts,
     resolveApproval,
     createTestApproval,
     runAuditReport,

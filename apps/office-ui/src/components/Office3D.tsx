@@ -2,7 +2,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
 import { useRef } from "react";
 import type { Group, Mesh, MeshStandardMaterial } from "three";
-import { STATUS_COLOR, STATUS_LABEL, type Seat } from "../types.ts";
+import { SLOT_STATUS_COLOR, STATUS_COLOR, STATUS_LABEL, type AccountSlot, type Seat } from "../types.ts";
 
 function Desk({ seat, selected, onSelect }: { seat: Seat; selected: boolean; onSelect: (id: string) => void }) {
   const avatar = useRef<Group>(null);
@@ -185,12 +185,97 @@ function LibraryBookshelf({ active, onOpen }: { active: boolean; onOpen: () => v
   );
 }
 
+function AccountsRack({
+  active,
+  slots,
+  onOpen,
+}: {
+  active: boolean;
+  slots: AccountSlot[];
+  onOpen: () => void;
+}) {
+  const readyCount = slots.filter((s) => s.status === "ready").length;
+  const lights = slots.slice(0, 12);
+
+  return (
+    <group
+      position={[-6.2, 0, -5.2]}
+      rotation={[0, Math.PI / 6, 0]}
+      onClick={(e) => {
+        e.stopPropagation();
+        onOpen();
+      }}
+      onPointerOver={() => (document.body.style.cursor = "pointer")}
+      onPointerOut={() => (document.body.style.cursor = "auto")}
+    >
+      {/* floor highlight */}
+      <mesh rotation-x={-Math.PI / 2} position={[0, 0.01, 0]} receiveShadow>
+        <circleGeometry args={[1.45, 40]} />
+        <meshStandardMaterial color={active ? "#2a3b5c" : "#1b2636"} />
+      </mesh>
+      {/* server rack body */}
+      <mesh position={[0, 1.1, 0]} castShadow>
+        <boxGeometry args={[1.55, 2.2, 0.72]} />
+        <meshStandardMaterial color="#1f2733" metalness={0.35} roughness={0.55} />
+      </mesh>
+      {/* front recessed panel */}
+      <mesh position={[0, 1.1, 0.35]}>
+        <boxGeometry args={[1.35, 1.98, 0.04]} />
+        <meshStandardMaterial color="#11161e" metalness={0.2} roughness={0.7} />
+      </mesh>
+      {/* rack bay dividers */}
+      {[0.45, 0.85, 1.25, 1.65].map((y) => (
+        <mesh key={y} position={[0, y, 0.38]}>
+          <boxGeometry args={[1.28, 0.04, 0.03]} />
+          <meshStandardMaterial color="#303846" />
+        </mesh>
+      ))}
+      {/* slot status lights */}
+      {lights.length > 0 ? (
+        lights.map((slot, idx) => {
+          const col = idx % 4;
+          const row = Math.floor(idx / 4);
+          const x = -0.42 + col * 0.28;
+          const y = 1.82 - row * 0.4;
+          const color = SLOT_STATUS_COLOR[slot.status];
+          return (
+            <mesh key={slot.id} position={[x, y, 0.4]}>
+              <sphereGeometry args={[0.065, 14, 14]} />
+              <meshStandardMaterial color={color} emissive={color} emissiveIntensity={active ? 1.8 : 1.1} />
+            </mesh>
+          );
+        })
+      ) : (
+        <mesh position={[0, 1.82, 0.4]}>
+          <sphereGeometry args={[0.065, 14, 14]} />
+          <meshStandardMaterial color="#6e7681" emissive="#6e7681" emissiveIntensity={0.4} />
+        </mesh>
+      )}
+      <Html position={[0, 2.55, 0]} center distanceFactor={13} zIndexRange={[10, 0]}>
+        <div
+          className={`desk-label accounts ${active ? "selected" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen();
+          }}
+        >
+          <strong>Tài khoản &amp; Hạn mức</strong>
+          <span>{slots.length > 0 ? `${readyCount}/${slots.length} sẵn sàng` : "Quản lý slot & quota"}</span>
+        </div>
+      </Html>
+    </group>
+  );
+}
+
 export default function Office3D({
   seats,
   selectedId,
   onSelect,
   libraryOpen,
   onOpenLibrary,
+  accountsOpen,
+  onOpenAccounts,
+  accountSlots,
   paused,
 }: {
   seats: Seat[];
@@ -198,6 +283,9 @@ export default function Office3D({
   onSelect: (id: string | null) => void;
   libraryOpen: boolean;
   onOpenLibrary: () => void;
+  accountsOpen: boolean;
+  onOpenAccounts: () => void;
+  accountSlots: AccountSlot[];
   paused: boolean;
 }) {
   return (
@@ -221,6 +309,7 @@ export default function Office3D({
         <Desk key={s.id} seat={s} selected={s.id === selectedId} onSelect={onSelect} />
       ))}
       <LibraryBookshelf active={libraryOpen} onOpen={onOpenLibrary} />
+      <AccountsRack active={accountsOpen} slots={accountSlots} onOpen={onOpenAccounts} />
       <OrbitControls
         enablePan={false}
         minDistance={6}
