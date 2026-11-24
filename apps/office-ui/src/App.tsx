@@ -274,10 +274,13 @@ export default function App() {
               ) : workspaceTab === "accounts" ? (
                 <AccountsPanel
                   accounts={hub.accounts}
+                  signInSessions={hub.signInSessions}
                   unsupported={hub.accountsUnsupported}
                   error={hub.accountsError}
                   online={online}
                   onRefresh={hub.refreshAccounts}
+                  onSignInSession={hub.updateSignInSession}
+                  onToast={setToast}
                 />
               ) : workspaceTab === "meeting" ? (
                 <MeetingRoomPanel

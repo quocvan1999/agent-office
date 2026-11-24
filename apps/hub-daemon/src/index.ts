@@ -38,6 +38,7 @@ import { KnowledgeLibrary, LibraryError } from "./library.ts";
 import { HubOrchestrator } from "./orchestrator.ts";
 import { OrgError, OrgService, resolveActorId } from "./org.ts";
 import { lintKnowledgeBudget, loadPolicies, TaskGuard } from "./policy.ts";
+import { redactSensitiveText, SignInManager, type SignInSession } from "./signin.ts";
 import { SecretsVault } from "./vault.ts";
 import { WorktreeManager } from "./worktree.ts";
 
@@ -60,6 +61,28 @@ if (args.has("--verify")) {
   writeFileSync(
     stubAgyBin,
     `#!/bin/sh
+if [ $# -eq 0 ]; then
+  printf "Welcome to the Antigravity CLI. You are currently not signed in.\\n"
+  printf "Select login method:\\n> 1. Google OAuth\\n  2. Use a Google Cloud project\\n"
+  IFS= read -r _choice
+  open "https://accounts.google.com/o/oauth2/auth?client_id=x&state=SECRET&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback"
+  printf "If you aren't automatically redirected, paste the authorization code below:\\n"
+  IFS= read -r code
+  code=$(printf '%s' "$code" | tr -d '\\r\\n')
+  case "$code" in
+    GOODCODE*)
+      touch "$HOME/.stub_signed_in"
+      mkdir -p "$HOME/.gemini/antigravity-cli"
+      printf "info email=signin-verify@example.com\\n" > "$HOME/.gemini/antigravity-cli/cli.log"
+      printf "Signed in successfully.\\n"
+      exit 0
+      ;;
+    *)
+      printf "Invalid code\\n"
+      exit 1
+      ;;
+  esac
+fi
 if [ "$1" = "--version" ]; then
   echo "agy 1.5.0-stub"
   exit 0
@@ -700,6 +723,145 @@ exit 0
 
     orgDb.close();
   } finally {
+    // keep tempAccRoot until web sign-in verification completes below
+  }
+
+  // 8. Verify Web Sign-In (pty-bridge + SignInManager + stub agy)
+  let signInDefaultRefusedOk = false;
+  let signInStartCaptureOk = false;
+  let signInSubmitCompleteOk = false;
+  let signInCancelOk = false;
+  let signInTimeoutOk = false;
+  let signInLogsCleanOk = false;
+  const tempSignInDbPath = join(tempAccRoot, "signin-verify.sqlite");
+  const capturedSignInLogs: string[] = [];
+  const origLog = console.log;
+  const origWarn = console.warn;
+  const origError = console.error;
+  const prevTimeoutEnv = process.env.SIGNIN_TIMEOUT_MS;
+
+  const waitForSignInState = async (
+    mgr: SignInManager,
+    slotId: string,
+    targetStates: Set<string>,
+    maxMs = 6000
+  ): Promise<SignInSession | null> => {
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline) {
+      const s = mgr.getSession(slotId);
+      if (s && targetStates.has(s.state)) return s;
+      await Bun.sleep(50);
+    }
+    return mgr.getSession(slotId);
+  };
+
+  console.log = (...items: unknown[]) => {
+    capturedSignInLogs.push(items.map(String).join(" "));
+  };
+  console.warn = (...items: unknown[]) => {
+    capturedSignInLogs.push(items.map(String).join(" "));
+  };
+  console.error = (...items: unknown[]) => {
+    capturedSignInLogs.push(items.map(String).join(" "));
+  };
+
+  try {
+    const signInDb = new OfficeDatabase(tempSignInDbPath);
+    const signInOrch = new HubOrchestrator(signInDb);
+    const signInAcc = new AccountsService({
+      db: signInDb,
+      orchestrator: signInOrch,
+      agyBin: stubAgyBin,
+      profilesRoot: tempProfilesRoot,
+      quotaRefreshMin: 0,
+      repoRoot: process.cwd(),
+    });
+    const signInMgr = new SignInManager({
+      accounts: signInAcc,
+      agyBin: stubAgyBin,
+    });
+
+    try {
+      // 8.1 Default slot refused unless force
+      try {
+        signInMgr.start("default");
+      } catch (err) {
+        signInDefaultRefusedOk = err instanceof AccountsError && err.status === 400;
+      }
+
+      // 8.2 Happy path: start -> awaiting_user (URL captured) -> submitCode -> completed + slot ready
+      const happySlot = signInAcc.createSlot({ name: "SignIn Happy" });
+      signInMgr.start(happySlot.id);
+      const awaiting = await waitForSignInState(signInMgr, happySlot.id, new Set(["awaiting_user"]));
+      signInStartCaptureOk =
+        awaiting?.state === "awaiting_user" &&
+        awaiting.authUrl ===
+          "https://accounts.google.com/o/oauth2/auth?client_id=x&state=SECRET&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback";
+
+      // Validation check: short / whitespace code rejected
+      let invalidCodeRejected = false;
+      try {
+        signInMgr.submitCode(happySlot.id, "short");
+      } catch (err) {
+        invalidCodeRejected = err instanceof AccountsError && err.status === 400;
+      }
+
+      signInMgr.submitCode(happySlot.id, "GOODCODE1234");
+      const completed = await waitForSignInState(
+        signInMgr,
+        happySlot.id,
+        new Set(["completed", "failed", "timeout"])
+      );
+      const happySlotAfter = signInAcc.getSlot(happySlot.id);
+      signInSubmitCompleteOk =
+        invalidCodeRejected &&
+        completed?.state === "completed" &&
+        happySlotAfter?.status === "ready" &&
+        happySlotAfter.email === "signin-verify@example.com";
+
+      // 8.3 Cancel path
+      const cancelSlot = signInAcc.createSlot({ name: "SignIn Cancel" });
+      signInMgr.start(cancelSlot.id);
+      const cancelAwaiting = await waitForSignInState(
+        signInMgr,
+        cancelSlot.id,
+        new Set(["awaiting_user"])
+      );
+      const cancelled = signInMgr.cancel(cancelSlot.id);
+      signInCancelOk = cancelAwaiting?.state === "awaiting_user" && cancelled.state === "cancelled";
+
+      // 8.4 Timeout path (short override via SIGNIN_TIMEOUT_MS)
+      process.env.SIGNIN_TIMEOUT_MS = "1200";
+      const timeoutSlot = signInAcc.createSlot({ name: "SignIn Timeout" });
+      signInMgr.start(timeoutSlot.id);
+      const timedOut = await waitForSignInState(signInMgr, timeoutSlot.id, new Set(["timeout"]), 5000);
+      signInTimeoutOk = timedOut?.state === "timeout";
+
+      // 8.5 Redaction check + no SECRET or GOODCODE in hub log output
+      const redactedSample = redactSensitiveText(
+        "https://accounts.google.com/o/oauth2/auth?state=SECRET&code=GOODCODE1234&nonce=N1"
+      );
+      const allLogs = capturedSignInLogs.join("\n");
+      signInLogsCleanOk =
+        !allLogs.includes("SECRET") &&
+        !allLogs.includes("GOODCODE") &&
+        !redactedSample.includes("SECRET") &&
+        !redactedSample.includes("GOODCODE") &&
+        redactedSample.includes("state=<redacted>") &&
+        redactedSample.includes("code=<redacted>");
+    } finally {
+      signInMgr.disposeAll();
+      signInDb.close();
+    }
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+    console.error = origError;
+    if (prevTimeoutEnv === undefined) {
+      delete process.env.SIGNIN_TIMEOUT_MS;
+    } else {
+      process.env.SIGNIN_TIMEOUT_MS = prevTimeoutEnv;
+    }
     try {
       rmSync(tempAccRoot, { recursive: true, force: true });
     } catch {
@@ -742,7 +904,13 @@ exit 0
       orgNonAdminStopAllOk &&
       orgTurnCapOk &&
       orgLoopGuardOk &&
-      orgMeetingRunOk,
+      orgMeetingRunOk &&
+      signInDefaultRefusedOk &&
+      signInStartCaptureOk &&
+      signInSubmitCompleteOk &&
+      signInCancelOk &&
+      signInTimeoutOk &&
+      signInLogsCleanOk,
     adapters: {
       antigravity: agyHealth,
       cursor: cursorHealth,
@@ -786,6 +954,14 @@ exit 0
       orgLoopGuardOk,
       orgMeetingRunOk,
     },
+    webSignIn: {
+      signInDefaultRefusedOk,
+      signInStartCaptureOk,
+      signInSubmitCompleteOk,
+      signInCancelOk,
+      signInTimeoutOk,
+      signInLogsCleanOk,
+    },
   };
   console.log(JSON.stringify(report, null, 2));
   process.exit(report.ok ? 0 : 1);
@@ -827,6 +1003,13 @@ const accountsService = new AccountsService({
   },
 });
 accountsService.startScheduler();
+
+const signInManager = new SignInManager({
+  accounts: accountsService,
+  onSessionUpdate: (session) => {
+    broadcastWs({ type: "signin", session });
+  },
+});
 
 const orgService = new OrgService({
   db,
@@ -1089,7 +1272,56 @@ const server = Bun.serve({
       }
     }
 
+    const slotSignInStartMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/signin\/start$/);
+    if (slotSignInStartMatch && req.method === "POST") {
+      const body = (await req.json().catch(() => ({}))) as { force?: boolean };
+      try {
+        const session = signInManager.start(decodeURIComponent(slotSignInStartMatch[1]), {
+          force: Boolean(body?.force),
+        });
+        return new Response(JSON.stringify(session, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const slotSignInCodeMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/signin\/code$/);
+    if (slotSignInCodeMatch && req.method === "POST") {
+      const body = (await req.json().catch(() => null)) as { code?: string } | null;
+      if (!body || typeof body !== "object") {
+        return jsonError(400, "Invalid JSON body");
+      }
+      try {
+        const session = signInManager.submitCode(
+          decodeURIComponent(slotSignInCodeMatch[1]),
+          body.code ?? ""
+        );
+        return new Response(JSON.stringify(session, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const slotSignInCancelMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/signin\/cancel$/);
+    if (slotSignInCancelMatch && req.method === "POST") {
+      try {
+        const session = signInManager.cancel(decodeURIComponent(slotSignInCancelMatch[1]));
+        return new Response(JSON.stringify(session, null, 2), { headers });
+      } catch (err) {
+        if (err instanceof AccountsError) return jsonError(err.status, err.message);
+        return jsonError(500, err instanceof Error ? err.message : String(err));
+      }
+    }
+
     const slotSignInMatch = url.pathname.match(/^\/api\/accounts\/slots\/([^/]+)\/signin$/);
+    if (slotSignInMatch && req.method === "GET") {
+      const slotId = decodeURIComponent(slotSignInMatch[1]);
+      const session = signInManager.getSession(slotId);
+      return new Response(JSON.stringify(session ?? { session: null }, null, 2), { headers });
+    }
+
     if (slotSignInMatch && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as { openTerminal?: boolean };
       try {
@@ -1506,6 +1738,9 @@ const server = Bun.serve({
       "/api/accounts/slots/:id",
       "/api/accounts/slots/:id/check",
       "/api/accounts/slots/:id/signin",
+      "/api/accounts/slots/:id/signin/start",
+      "/api/accounts/slots/:id/signin/code",
+      "/api/accounts/slots/:id/signin/cancel",
       "/api/accounts/providers/:id",
       "/api/agy/jobs",
       "/api/agy/jobs/:id",
