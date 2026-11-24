@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "loopGuard": {
+    "repeatedFileEditWarn": 3,
+    "repeatedFileEditAbort": 4,
+    "repeatedFileEditWindowMs": 600000,
+    "repeatedFailingCmdWarn": 2,
+    "repeatedFailingCmdAbortConsecutive": 3,
+    "repeatedFailingCmdAbortPerTask": 4,
+    "noProgressToolBurstAbort": 8,
+    "maxStepsNormal": 25,
+    "maxStepsLarge": 40
+  },
+  "contextGuard": {
+    "charsPerTokenEstimate": 3.5,
+    "maxToolOutputChars": 25000,
+    "warnTurns": 12,
+    "warnChars": 140000,
+    "abortTurns": 20,
+    "abortChars": 280000,
+    "compactBriefMaxChars": 1500
+  },
+  "routing": {
+    "pinAntigravityAccountPerSession": true,
+    "disallowDuplicateParallelTask": true,
+    "tiers": {
+      "0": { "provider": "api", "roles": ["summarize", "classify", "commit-note", "json-extract"] },
+      "1": { "provider": "antigravity", "defaultEffort": "low", "roles": ["ui", "crud", "tests", "small-refactor"] },
+      "2": { "provider": "codex", "roles": ["autonomous-verified", "batch-worktree"] },
+      "3": { "provider": "cursor", "roles": ["core-architecture", "multi-file-debug", "escalation"] }
+    }
+  },
+  "knowledgeBudget": {
+    "bytesPerTokenSafe": 3.2,
+    "alwaysOnWarnTokens": 15000,
+    "alwaysOnBlockTokens": 19000,
+    "alwaysOnHardLimitTokens": 20000,
+    "antigravityFileWarnBytes": 20480,
+    "antigravityFileBlockBytes": 24064,
+    "antigravityFileHardLimitBytes": 24576,
+    "feedbackLogWarnLines": 150
+  }
+}
