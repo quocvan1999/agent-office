@@ -96,3 +96,77 @@ export const STATUS_COLOR: Record<SeatStatus, string> = {
   stopped: "#8c8c8c",
   offline: "#3b4252",
 };
+
+// Phase 3: Knowledge Library, Sync, AI Audit
+export type LibArea = "rules" | "kits" | "skills" | "agents" | "hooks" | "feedback";
+
+export interface LibEntry {
+  path: string;
+  area: LibArea;
+  size: number;
+  tokens: number;
+  mtime: string;
+}
+
+export interface LibraryTreeResponse {
+  root: string;
+  writable: boolean;
+  entries: LibEntry[];
+}
+
+export interface LibraryFileResponse {
+  path: string;
+  content: string;
+  tokens: number;
+  mtime: string;
+}
+
+export interface SaveLibraryFileRequest {
+  path: string;
+  content: string;
+  note: string;
+  expectedMtime?: string;
+}
+
+export interface SaveLibraryFileResponse {
+  ok: true;
+  backupPath: string;
+  pluginVersion: string;
+  tokensBefore: number;
+  tokensAfter: number;
+}
+
+export interface SyncResult {
+  ok: boolean;
+  dryRun: boolean;
+  exitCode: number;
+  output: string;
+  skipped?: string;
+}
+
+export type AuditSeverity = "info" | "warning" | "critical";
+
+export interface AuditFinding {
+  severity: AuditSeverity;
+  code: string;
+  path?: string;
+  message: string;
+  estSavedTokens?: number;
+}
+
+export interface AuditReport {
+  id: string;
+  at: string;
+  kind: "rule" | "ai";
+  totals: {
+    files: number;
+    tokens: number;
+    alwaysLoadedTokens: number;
+  };
+  findings: AuditFinding[];
+  aiSummary?: string;
+}
+
+export interface TestApprovalResponse {
+  approval: PendingApproval;
+}
